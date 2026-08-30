@@ -1,0 +1,24 @@
+# systemd-юнит для Linux-сервера (GCP, Oracle, Hetzner — любой).
+# Установка:
+#   sudo cp deploy/zavodbot.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now zavodbot
+# Логи:  journalctl -u zavodbot -f
+[Unit]
+Description=Zavod shifts Telegram bot
+After=network-online.target
+Wants=network-online.target
+# Не даём перезапускам зациклиться при неверном токене (ключи живут в [Unit], не в [Service])
+StartLimitBurst=5
+StartLimitIntervalSec=120
+
+[Service]
+Type=simple
+User=zavodbot
+WorkingDirectory=/opt/zavodBot
+ExecStart=/opt/zavodBot/.venv/bin/python /opt/zavodBot/bot.py
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
