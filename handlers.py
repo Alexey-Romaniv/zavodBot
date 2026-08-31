@@ -1,20 +1,22 @@
 """Хендлеры Telegram: команды, выбор смен на неделю, отмена, деньги, ручной ввод."""
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, time, timedelta
 from decimal import Decimal
 
 from aiogram import F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import BufferedInputFile, CallbackQuery, Message
 
 import achievements
 import config
 import db
 import domain
 import keyboards as kb
+import notify
 import parsing
 import reports
 import texts
@@ -27,6 +29,7 @@ class Flow(StatesGroup):
     manual_entry = State()
     custom_hours = State()
     penalty_entry = State()
+    payout_amount = State()
 
 
 # --- Команды --------------------------------------------------------------
@@ -107,6 +110,168 @@ async def cmd_ask_on(message: Message) -> None:
 async def cmd_ask_off(message: Message) -> None:
     db.set_weekly_ask(message.from_user.id, False)
     await message.answer("Больше не буду спрашивать сам. Записать смены: /week")
+
+
+# --- Настройки и тишина ---------------------------------------------------
+
+@router.message(Command("settings"))
+async def cmd_settings(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    db.ensure_user(message.from_user.id)
+    await message.answer(
+        reports.settings_report(message.from_user.id),
+        reply_markup=kb.settings_menu(db.prefs(message.from_user.id)),
+    )
+
+
+async def _edit(call: CallbackQuery, text: str, markup) -> None:
+    """Перерисовать сообщение. Если выбрали то же самое, Telegram отказывается
+    менять сообщение на идентичное — для нас это просто «нечего делать»."""
+    try:
+        await call.message.edit_text(text, reply_markup=markup)
+    except TelegramBadRequest:
+        pass
+
+
+async def _show_settings(call: CallbackQuery) -> None:
+    await _edit(
+        call,
+        reports.settings_report(call.from_user.id),
+        kb.settings_menu(db.prefs(call.from_user.id)),
+    )
+
+
+@router.callback_query(kb.SettingsCb.filter(F.action == "menu"))
+async def cb_settings_menu(call: CallbackQuery) -> None:
+    await _show_settings(call)
+    await call.answer()
+
+
+@router.callback_query(kb.SettingsCb.filter(F.action == "toggle"))
+async def cb_settings_toggle(call: CallbackQuery, callback_data: kb.SettingsCb) -> None:
+    if callback_data.arg not in db.PREF_FLAGS:
+        await call.answer("Неизвестная настройка", show_alert=True)
+        return
+    prefs = db.prefs(call.from_user.id)
+    db.set_flag(call.from_user.id, callback_data.arg, not getattr(prefs, callback_data.arg))
+    await _show_settings(call)
+    await call.answer("Изменил")
+
+
+@router.callback_query(kb.SettingsCb.filter(F.action == "quiet"))
+async def cb_settings_quiet(call: CallbackQuery) -> None:
+    prefs = db.prefs(call.from_user.id)
+    await _edit(
+        call,
+        "🌙 <b>Тихие часы</b>\n"
+        "В это время бот молчит: напоминание про утреннюю смену уезжает на вечер"
+        " накануне, а вопрос про ночную — на день.\n\n"
+        "<i>Единственное, что приходит всё равно — «пора выходить» перед сменой.</i>",
+        kb.quiet_choice(prefs),
+    )
+    await call.answer()
+
+
+@router.callback_query(kb.SettingsCb.filter(F.action == "quiet_set"))
+async def cb_settings_quiet_set(call: CallbackQuery, callback_data: kb.SettingsCb) -> None:
+    if callback_data.arg == "off":
+        # начало == конец: тихих часов нет
+        db.set_quiet(call.from_user.id, time(0, 0), time(0, 0))
+    else:
+        raw_from, _, raw_to = callback_data.arg.partition("-")
+        try:
+            db.set_quiet(call.from_user.id, time(int(raw_from)), time(int(raw_to)))
+        except ValueError:
+            await call.answer("Не понял время", show_alert=True)
+            return
+    await _show_settings(call)
+    await call.answer("Тихие часы обновлены")
+
+
+@router.callback_query(kb.SettingsCb.filter(F.action == "evening"))
+async def cb_settings_evening(call: CallbackQuery) -> None:
+    await _edit(
+        call,
+        "🌆 <b>Вечернее напоминание</b>\n"
+        "Во сколько предупреждать накануне, если «за 2 часа» попадает в тихие часы"
+        " (1я смена в 06:00 — это 04:00).",
+        kb.evening_choice(db.prefs(call.from_user.id)),
+    )
+    await call.answer()
+
+
+@router.callback_query(kb.SettingsCb.filter(F.action == "evening_set"))
+async def cb_settings_evening_set(call: CallbackQuery, callback_data: kb.SettingsCb) -> None:
+    if not callback_data.arg.isdigit() or not 0 <= int(callback_data.arg) <= 23:
+        await call.answer("Не понял час", show_alert=True)
+        return
+    db.set_evening_hour(call.from_user.id, int(callback_data.arg))
+    await _show_settings(call)
+    await call.answer("Запомнил")
+
+
+def _mute_text(prefs) -> str:
+    return (
+        f"🔇 Молчу до <b>{prefs.muted_until:%H:%M}</b>"
+        f" ({domain.fmt_date(prefs.muted_until.date())}).\n\n"
+        "Напоминание «пора выходить» перед сменой всё равно придёт — иначе тишина"
+        " стоила бы прогула. Вопрос про часы задам, когда снова смогу писать.\n"
+        "Вернуть звук: /unmute"
+    )
+
+
+@router.message(Command("mute"))
+async def cmd_mute(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    db.ensure_user(message.from_user.id)
+    prefs = db.prefs(message.from_user.id)
+    until = notify.mute_until(prefs, domain.now())
+    db.set_muted_until(message.from_user.id, until)
+    prefs = db.prefs(message.from_user.id)
+    await message.answer(_mute_text(prefs), reply_markup=kb.mute_menu(prefs))
+
+
+@router.message(Command("unmute"))
+async def cmd_unmute(message: Message) -> None:
+    db.ensure_user(message.from_user.id)
+    db.set_muted_until(message.from_user.id, None)
+    await message.answer("🔔 Снова на связи. Заглушить: /mute")
+
+
+@router.callback_query(kb.SettingsCb.filter(F.action == "mute"))
+async def cb_settings_mute(call: CallbackQuery) -> None:
+    prefs = db.prefs(call.from_user.id)
+    db.set_muted_until(call.from_user.id, notify.mute_until(prefs, domain.now()))
+    prefs = db.prefs(call.from_user.id)
+    await _edit(call, _mute_text(prefs), kb.mute_menu(prefs))
+    await call.answer("Молчу")
+
+
+@router.callback_query(kb.SettingsCb.filter(F.action == "mute_set"))
+async def cb_settings_mute_set(call: CallbackQuery, callback_data: kb.SettingsCb) -> None:
+    prefs = db.prefs(call.from_user.id)
+    moment = domain.now()
+    if callback_data.arg == "24h":
+        until = moment + timedelta(hours=24)
+    else:
+        until = notify.mute_until_morning(prefs, moment)
+    db.set_muted_until(call.from_user.id, until)
+    prefs = db.prefs(call.from_user.id)
+    await _edit(call, _mute_text(prefs), kb.mute_menu(prefs))
+    await call.answer("Молчу")
+
+
+@router.callback_query(kb.SettingsCb.filter(F.action == "unmute"))
+async def cb_settings_unmute(call: CallbackQuery) -> None:
+    db.set_muted_until(call.from_user.id, None)
+    await _show_settings(call)
+    await call.answer("Снова на связи")
+
+
+@router.callback_query(kb.SettingsCb.filter(F.action == "close"))
+async def cb_settings_close(call: CallbackQuery) -> None:
+    await call.message.edit_text("Ок. Настройки — /settings")
+    await call.answer()
 
 
 # --- Смены на неделю ------------------------------------------------------
@@ -322,18 +487,107 @@ async def cmd_money(message: Message, state: FSMContext) -> None:
     year, month = domain.period_anchor(domain.today())
     await message.answer(
         reports.money_report(message.from_user.id, year, month),
-        reply_markup=kb.money_nav(year, month),
+        reply_markup=kb.money_nav(message.from_user.id, year, month),
     )
 
 
-@router.callback_query(kb.MoneyCb.filter())
+def _ym(raw: str) -> tuple[int, int]:
+    year, month = (int(x) for x in raw.split("-"))
+    return year, month
+
+
+@router.callback_query(kb.MoneyCb.filter(F.action == "nav"))
 async def cb_money(call: CallbackQuery, callback_data: kb.MoneyCb) -> None:
-    year, month = (int(x) for x in callback_data.ym.split("-"))
+    year, month = _ym(callback_data.ym)
     await call.message.edit_text(
         reports.money_report(call.from_user.id, year, month),
-        reply_markup=kb.money_nav(year, month),
+        reply_markup=kb.money_nav(call.from_user.id, year, month),
     )
     await call.answer()
+
+
+# --- Сверка с фактической выплатой ----------------------------------------
+
+@router.callback_query(kb.MoneyCb.filter(F.action == "payout"))
+async def cb_payout_ask(call: CallbackQuery, callback_data: kb.MoneyCb, state: FSMContext) -> None:
+    year, month = _ym(callback_data.ym)
+    period = reports.period_data(call.from_user.id, year, month)
+    await state.set_state(Flow.payout_amount)
+    await state.update_data(year=year, month=month)
+    await call.message.answer(
+        f"💳 <b>Выплата за {domain.period_title(year, month)}</b>\n"
+        f"По моему расчёту на руки: <b>{domain.money(period.net)}</b>\n\n"
+        "Напиши, сколько пришло фактически — например <code>4520</code>"
+        " или <code>4520,35</code>. Сверю и покажу разницу.\n"
+        "Отмена — /cancel",
+    )
+    await call.answer()
+
+
+@router.message(Flow.payout_amount, F.text)
+async def on_payout_amount(message: Message, state: FSMContext) -> None:
+    amount = parsing.parse_amount(message.text)
+    if amount is None:
+        await message.answer(
+            "Не понял сумму. Например: <code>4520</code> или <code>4520,35</code>."
+            "\nОтмена — /cancel"
+        )
+        return
+    data = await state.get_data()
+    await state.clear()
+    year, month = data["year"], data["month"]
+    db.set_payout(message.from_user.id, year, month, amount)
+    await message.answer(
+        reports.payout_check(message.from_user.id, year, month),
+        reply_markup=kb.money_nav(message.from_user.id, year, month),
+    )
+
+
+@router.callback_query(kb.MoneyCb.filter(F.action == "check"))
+async def cb_payout_check(call: CallbackQuery, callback_data: kb.MoneyCb) -> None:
+    year, month = _ym(callback_data.ym)
+    await call.message.answer(
+        reports.payout_check(call.from_user.id, year, month),
+        reply_markup=kb.money_nav(call.from_user.id, year, month),
+    )
+    await call.answer()
+
+
+@router.callback_query(kb.MoneyCb.filter(F.action == "payout_del"))
+async def cb_payout_delete(call: CallbackQuery, callback_data: kb.MoneyCb) -> None:
+    year, month = _ym(callback_data.ym)
+    db.delete_payout(call.from_user.id, year, month)
+    await call.message.edit_text(
+        reports.money_report(call.from_user.id, year, month),
+        reply_markup=kb.money_nav(call.from_user.id, year, month),
+    )
+    await call.answer("Убрал отметку о выплате")
+
+
+# --- Выгрузка периода -----------------------------------------------------
+
+async def _send_export(message: Message, user_id: int, year: int, month: int) -> None:
+    document = BufferedInputFile(
+        reports.period_csv(user_id, year, month), filename=reports.export_name(year, month)
+    )
+    await message.answer_document(
+        document, caption=reports.export_caption(user_id, year, month)
+    )
+
+
+@router.message(Command("export"))
+async def cmd_export(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    db.ensure_user(message.from_user.id)
+    year, month = domain.period_anchor(domain.today())
+    await _send_export(message, message.from_user.id, year, month)
+
+
+@router.callback_query(kb.MoneyCb.filter(F.action == "export"))
+async def cb_money_export(call: CallbackQuery, callback_data: kb.MoneyCb) -> None:
+    year, month = _ym(callback_data.ym)
+    await _send_export(call.message, call.from_user.id, year, month)
+    await call.answer("Готово")
 
 
 # --- Штрафы ---------------------------------------------------------------
@@ -509,7 +763,7 @@ async def on_manual_entry(message: Message, state: FSMContext) -> None:
     year, month = data["year"], data["month"]
     await message.answer(
         reports.money_report(message.from_user.id, year, month),
-        reply_markup=kb.money_nav(year, month),
+        reply_markup=kb.money_nav(message.from_user.id, year, month),
     )
     await award(message, message.from_user.id)
 

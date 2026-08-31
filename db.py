@@ -1,77 +1,25 @@
-"""Слой доступа к SQLite. Синхронный, под личный бот этого более чем достаточно."""
+"""Слой доступа к SQLite. Синхронный, под личный бот этого более чем достаточно.
+
+Схема и её изменения — в migrations.py.
+"""
 from __future__ import annotations
 
+import logging
 import sqlite3
 import threading
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 
 import config
 import domain
+import migrations
+import notify
+
+log = logging.getLogger(__name__)
 
 _lock = threading.Lock()
 _conn: sqlite3.Connection | None = None
-
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS users (
-    user_id     INTEGER PRIMARY KEY,
-    weekly_ask  INTEGER NOT NULL DEFAULT 1,
-    toxic       INTEGER NOT NULL DEFAULT 1,   -- тон достижений: 1 — стёб, 0 — по-доброму
-    ach_intro   INTEGER NOT NULL DEFAULT 0,   -- показывали ли сводку по старым сменам
-    username    TEXT,                         -- @ник без собаки; Telegram разрешает его менять
-    first_name  TEXT,
-    last_name   TEXT,
-    created_at  TEXT    NOT NULL
-);
-CREATE TABLE IF NOT EXISTS shifts (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id     INTEGER NOT NULL,
-    work_date   TEXT    NOT NULL,                    -- ISO-дата выхода на смену
-    shift_num   INTEGER NOT NULL,                    -- 1, 2 или 3
-    status      TEXT    NOT NULL DEFAULT 'planned',  -- planned | done | absent | cancelled
-    reminded    INTEGER NOT NULL DEFAULT 0,
-    worked_hours REAL,                                 -- NULL = смена ещё не подтверждена
-    confirm_asked INTEGER NOT NULL DEFAULT 0,
-    confirmed_at TEXT,                          -- когда пользователь подтвердил смену
-    created_at  TEXT    NOT NULL,
-    UNIQUE (user_id, work_date, shift_num)
-);
-CREATE INDEX IF NOT EXISTS idx_shifts_user_date ON shifts (user_id, work_date);
-CREATE TABLE IF NOT EXISTS achievements (
-    user_id     INTEGER NOT NULL,
-    code        TEXT    NOT NULL,
-    unlocked_at TEXT    NOT NULL,
-    PRIMARY KEY (user_id, code)
-);
-CREATE TABLE IF NOT EXISTS penalties (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id     INTEGER NOT NULL,
-    at_date     TEXT    NOT NULL,   -- день нарушения: он определяет расчётный период
-    kind        TEXT    NOT NULL,   -- absence | late | break | notice | other
-    amount      REAL    NOT NULL,   -- сумма нетто, обычно из договора
-    shift_id    INTEGER,            -- смена, если штраф привязан к ней
-    note        TEXT,
-    created_at  TEXT    NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_penalties_user_date ON penalties (user_id, at_date);
-CREATE TABLE IF NOT EXISTS periods (
-    user_id  INTEGER NOT NULL,
-    ym       TEXT    NOT NULL,   -- YYYY-MM месяца-якоря периода
-    rate_cut INTEGER,            -- снижена ли ставка: 1 | 0 | NULL (решаем сами)
-    PRIMARY KEY (user_id, ym)
-);
-CREATE TABLE IF NOT EXISTS events (
-    user_id INTEGER NOT NULL,
-    key     TEXT    NOT NULL,   -- money_view | ach_view | empty_view
-    at      TEXT    NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_events_user_key ON events (user_id, key);
-CREATE TABLE IF NOT EXISTS admin_sessions (
-    user_id    INTEGER PRIMARY KEY,
-    granted_at TEXT    NOT NULL   -- когда ввели пароль; сессия живёт config.ADMIN_SESSION
-);
-"""
 
 
 @dataclass(frozen=True)
@@ -85,6 +33,7 @@ class Shift:
     worked_hours: float | None = None
     confirm_asked: bool = False
     confirmed_at: datetime | None = None
+    leave_reminded: bool = False
 
     @property
     def kind(self) -> domain.ShiftKind:
@@ -154,6 +103,7 @@ def _row(r: sqlite3.Row) -> Shift:
         worked_hours=r["worked_hours"],
         confirm_asked=bool(r["confirm_asked"]),
         confirmed_at=_dt(r["confirmed_at"]),
+        leave_reminded=bool(r["leave_reminded"]),
     )
 
 
@@ -173,34 +123,24 @@ def _penalty(r: sqlite3.Row) -> Penalty:
     )
 
 
-# Миграции для баз, созданных более старой версией бота: (колонка, определение)
-MIGRATIONS = (
-    ("worked_hours", "REAL"),
-    ("confirm_asked", "INTEGER NOT NULL DEFAULT 0"),
-    ("confirmed_at", "TEXT"),
-)
-USER_MIGRATIONS = (
-    ("toxic", "INTEGER NOT NULL DEFAULT 1"),
-    ("ach_intro", "INTEGER NOT NULL DEFAULT 0"),
-    ("username", "TEXT"),
-    ("first_name", "TEXT"),
-    ("last_name", "TEXT"),
-)
-
-
 def init() -> None:
+    """Открыть базу и догнать схему до актуальной версии.
+
+    Схема живёт в migrations.py: там же и бэкап перед изменениями. На сервере
+    миграции прогоняются отдельной командой до перезапуска бота, здесь — на всякий
+    случай, чтобы запуск на чистой машине не требовал лишних шагов.
+    """
     global _conn
     config.DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     _conn = sqlite3.connect(config.DB_PATH, check_same_thread=False)
     _conn.row_factory = sqlite3.Row
     with _lock:
-        _conn.executescript(SCHEMA)
-        for table, migrations in (("shifts", MIGRATIONS), ("users", USER_MIGRATIONS)):
-            have = {r["name"] for r in _conn.execute(f"PRAGMA table_info({table})")}
-            for column, definition in migrations:
-                if column not in have:
-                    _conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
-        _conn.commit()
+        applied = migrations.upgrade(_conn, config.DB_PATH)
+        if applied:
+            log.info(
+                "Схема обновлена до версии %s (%s)",
+                migrations.TARGET, ", ".join(m.name for m in applied),
+            )
 
 
 def _c() -> sqlite3.Connection:
@@ -250,9 +190,7 @@ def remember_profile(
 
 
 def set_weekly_ask(user_id: int, enabled: bool) -> None:
-    with _lock:
-        _c().execute("UPDATE users SET weekly_ask = ? WHERE user_id = ?", (int(enabled), user_id))
-        _c().commit()
+    set_flag(user_id, "weekly_ask", enabled)
 
 
 def weekly_ask_enabled(user_id: int) -> bool:
@@ -262,9 +200,112 @@ def weekly_ask_enabled(user_id: int) -> bool:
 
 
 def users_to_ask() -> list[int]:
+    return users_with("weekly_ask")
+
+
+# --- Настройки уведомлений ------------------------------------------------
+
+# Тумблеры «вкл/выкл» из таблицы users. Имена совпадают с полями notify.Prefs
+# и с колонками — так /settings обходится одним обработчиком на все переключатели.
+PREF_FLAGS = (
+    "weekly_ask", "monday_plan", "confirm_ping", "period_news", "leave_ping", "toxic",
+)
+
+PREF_COLUMNS = (
+    "user_id, weekly_ask, monday_plan, confirm_ping, period_news, leave_ping, toxic, "
+    "quiet_from, quiet_to, evening_hour, muted_until"
+)
+
+
+def _hhmm(value: str | None) -> time | None:
+    try:
+        return time.fromisoformat(value) if value else None
+    except ValueError:  # ручная правка базы не повод падать
+        return None
+
+
+def _prefs(r: sqlite3.Row) -> notify.Prefs:
+    """Строка users -> Prefs. NULL в колонке означает «как в config»."""
+    quiet_from = _hhmm(r["quiet_from"])
+    quiet_to = _hhmm(r["quiet_to"])
+    return notify.Prefs(
+        user_id=r["user_id"],
+        weekly_ask=bool(r["weekly_ask"]),
+        monday_plan=bool(r["monday_plan"]),
+        confirm_ping=bool(r["confirm_ping"]),
+        period_news=bool(r["period_news"]),
+        leave_ping=bool(r["leave_ping"]),
+        toxic=bool(r["toxic"]),
+        quiet_from=config.QUIET_FROM if quiet_from is None else quiet_from,
+        quiet_to=config.QUIET_TO if quiet_to is None else quiet_to,
+        evening_hour=(
+            config.EVENING_HOUR if r["evening_hour"] is None else int(r["evening_hour"])
+        ),
+        muted_until=_dt(r["muted_until"]),
+    )
+
+
+def prefs(user_id: int) -> notify.Prefs:
     with _lock:
-        rows = _c().execute("SELECT user_id FROM users WHERE weekly_ask = 1").fetchall()
+        r = _c().execute(
+            f"SELECT {PREF_COLUMNS} FROM users WHERE user_id = ?", (user_id,)
+        ).fetchone()
+    return _prefs(r) if r else notify.Prefs(user_id=user_id)
+
+
+def all_prefs() -> dict[int, notify.Prefs]:
+    """Настройки всех пользователей сразу — планировщику дешевле одним запросом."""
+    with _lock:
+        rows = _c().execute(f"SELECT {PREF_COLUMNS} FROM users").fetchall()
+    return {r["user_id"]: _prefs(r) for r in rows}
+
+
+def set_flag(user_id: int, name: str, value: bool) -> None:
+    if name not in PREF_FLAGS:
+        raise ValueError(f"неизвестная настройка: {name}")
+    with _lock:
+        _c().execute(f"UPDATE users SET {name} = ? WHERE user_id = ?", (int(value), user_id))
+        _c().commit()
+
+
+def users_with(flag: str) -> list[int]:
+    """Кому включено это уведомление."""
+    if flag not in PREF_FLAGS:
+        raise ValueError(f"неизвестная настройка: {flag}")
+    with _lock:
+        rows = _c().execute(f"SELECT user_id FROM users WHERE {flag} = 1").fetchall()
     return [r["user_id"] for r in rows]
+
+
+def set_quiet(user_id: int, quiet_from: time | None, quiet_to: time | None) -> None:
+    """Тихие часы. None/None — вернуться к значениям из config."""
+    with _lock:
+        _c().execute(
+            "UPDATE users SET quiet_from = ?, quiet_to = ? WHERE user_id = ?",
+            (
+                quiet_from.isoformat(timespec="minutes") if quiet_from else None,
+                quiet_to.isoformat(timespec="minutes") if quiet_to else None,
+                user_id,
+            ),
+        )
+        _c().commit()
+
+
+def set_evening_hour(user_id: int, hour: int | None) -> None:
+    with _lock:
+        _c().execute(
+            "UPDATE users SET evening_hour = ? WHERE user_id = ?", (hour, user_id)
+        )
+        _c().commit()
+
+
+def set_muted_until(user_id: int, until: datetime | None) -> None:
+    with _lock:
+        _c().execute(
+            "UPDATE users SET muted_until = ? WHERE user_id = ?",
+            (until.isoformat(timespec="seconds") if until else None, user_id),
+        )
+        _c().commit()
 
 
 # --- Смены ---------------------------------------------------------------
@@ -286,7 +327,8 @@ def add_shift(user_id: int, work_date: date, shift_num: int) -> str:
             result = "added"
         elif cur["status"] == "cancelled":
             _c().execute(
-                "UPDATE shifts SET status = 'planned', reminded = 0 WHERE id = ?", (cur["id"],)
+                "UPDATE shifts SET status = 'planned', reminded = 0, leave_reminded = 0 "
+                "WHERE id = ?", (cur["id"],)
             )
             result = "restored"
         else:
@@ -357,24 +399,58 @@ def upcoming_shifts(user_id: int, limit: int = 20) -> list[Shift]:
     return [s for s in shifts if domain.shift_end(s.work_date, s.shift_num) > n]
 
 
-def due_reminders(moment: datetime) -> list[Shift]:
-    """Смены, по которым пора напомнить: время напоминания наступило,
-    смена ещё не началась, напоминание не отправлено."""
-    horizon = (moment + config.REMIND_BEFORE).date()
+def _pending_shifts(moment: datetime, column: str) -> list[Shift]:
+    """Запланированные смены рядом с `moment`, по которым напоминание ещё не ушло.
+
+    Окно с запасом в сутки: напоминание про утреннюю смену уезжает на вечер
+    накануне, а пропущенное из-за простоя бота досылается позже.
+    """
     with _lock:
         rows = _c().execute(
-            "SELECT * FROM shifts WHERE status = 'planned' AND reminded = 0 "
+            f"SELECT * FROM shifts WHERE status = 'planned' AND {column} = 0 "
             "AND work_date BETWEEN ? AND ?",
-            ((moment.date() - timedelta(days=1)).isoformat(), horizon.isoformat()),
+            (
+                (moment.date() - timedelta(days=1)).isoformat(),
+                (moment.date() + timedelta(days=2)).isoformat(),
+            ),
         ).fetchall()
+    return [_row(r) for r in rows]
+
+
+def due_reminders(moment: datetime, by_user: dict[int, notify.Prefs] | None = None) -> list[Shift]:
+    """Смены, по которым пора напомнить: время напоминания наступило,
+    смена ещё не началась, напоминание не отправлено.
+
+    Время напоминания зависит от настроек пользователя (тихие часы), поэтому
+    берём их одним запросом и складываем в словарь.
+    """
+    users = all_prefs() if by_user is None else by_user
     due = []
-    for r in rows:
-        s = _row(r)
-        if domain.remind_at(s.work_date, s.shift_num) <= moment < domain.shift_start(
+    for s in _pending_shifts(moment, "reminded"):
+        p = users.get(s.user_id) or notify.Prefs(user_id=s.user_id)
+        if notify.remind_at(p, s.work_date, s.shift_num) <= moment < domain.shift_start(
             s.work_date, s.shift_num
         ):
             due.append(s)
     return due
+
+
+def due_leave_reminders(moment: datetime) -> list[Shift]:
+    """Смены, до начала которых остались минуты — время короткого «пора выходить».
+
+    Настройки тут не нужны: это напоминание приходит всегда в одно и то же время.
+    """
+    return [
+        s for s in _pending_shifts(moment, "leave_reminded")
+        if notify.leave_at(s.work_date, s.shift_num) <= moment
+        < domain.shift_start(s.work_date, s.shift_num)
+    ]
+
+
+def mark_leave_reminded(shift_id: int) -> None:
+    with _lock:
+        _c().execute("UPDATE shifts SET leave_reminded = 1 WHERE id = ?", (shift_id,))
+        _c().commit()
 
 
 def confirm_shift(shift_id: int, user_id: int, hours: Decimal | None) -> Shift | None:
@@ -394,8 +470,15 @@ def confirm_shift(shift_id: int, user_id: int, hours: Decimal | None) -> Shift |
     return _row(r)
 
 
-def shifts_awaiting_ask(moment: datetime) -> list[Shift]:
-    """Закончившиеся смены, о которых бот ещё не спрашивал «как прошла»."""
+def shifts_awaiting_ask(
+    moment: datetime, by_user: dict[int, notify.Prefs] | None = None
+) -> list[Shift]:
+    """Закончившиеся смены, о которых бот ещё не спрашивал «как прошла».
+
+    Момент вопроса тоже зависит от настроек: после ночной смены человек спит,
+    поэтому её переносим на день.
+    """
+    users = all_prefs() if by_user is None else by_user
     with _lock:
         rows = _c().execute(
             "SELECT * FROM shifts WHERE status = 'planned' AND confirm_asked = 0 "
@@ -405,7 +488,8 @@ def shifts_awaiting_ask(moment: datetime) -> list[Shift]:
     ready = []
     for r in rows:
         s = _row(r)
-        if domain.shift_end(s.work_date, s.shift_num) + config.CONFIRM_AFTER <= moment:
+        p = users.get(s.user_id) or notify.Prefs(user_id=s.user_id)
+        if notify.confirm_at(p, s.work_date, s.shift_num) <= moment:
             ready.append(s)
     return ready
 
@@ -426,6 +510,14 @@ def unconfirmed_shifts(user_id: int, limit: int = 30) -> list[Shift]:
         ).fetchall()
     now = domain.now()
     return [s for s in (_row(r) for r in rows) if domain.shift_end(s.work_date, s.shift_num) <= now]
+
+
+def ignored_shifts(user_id: int) -> list[Shift]:
+    """Смены, про которые бот уже спрашивал, а ответа так и нет.
+
+    Именно они портят расчёт: пока часы не подтверждены, считаются полные 8 ч.
+    """
+    return [s for s in unconfirmed_shifts(user_id) if s.confirm_asked]
 
 
 def mark_reminded(shift_id: int) -> None:
@@ -500,6 +592,39 @@ def penalty_for_shift(user_id: int, shift_id: int, kind: str) -> Penalty | None:
             (user_id, shift_id, kind),
         ).fetchone()
     return _penalty(r) if r else None
+
+
+# --- Фактические выплаты --------------------------------------------------
+
+def set_payout(user_id: int, year: int, month: int, amount: Decimal) -> None:
+    """Запомнить, сколько реально пришло за период, — для сверки с расчётом."""
+    with _lock:
+        _c().execute(
+            "INSERT INTO payouts (user_id, ym, amount, at) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(user_id, ym) DO UPDATE SET "
+            "amount = excluded.amount, at = excluded.at",
+            (user_id, f"{year}-{month:02d}", float(amount), _now_iso()),
+        )
+        _c().commit()
+
+
+def get_payout(user_id: int, year: int, month: int) -> Decimal | None:
+    with _lock:
+        r = _c().execute(
+            "SELECT amount FROM payouts WHERE user_id = ? AND ym = ?",
+            (user_id, f"{year}-{month:02d}"),
+        ).fetchone()
+    return Decimal(str(r["amount"])) if r else None
+
+
+def delete_payout(user_id: int, year: int, month: int) -> bool:
+    with _lock:
+        cur = _c().execute(
+            "DELETE FROM payouts WHERE user_id = ? AND ym = ?",
+            (user_id, f"{year}-{month:02d}"),
+        )
+        _c().commit()
+    return cur.rowcount > 0
 
 
 def rate_cut_flag(user_id: int, year: int, month: int) -> bool | None:
@@ -593,9 +718,7 @@ def lock_achievements(user_id: int, codes) -> None:
 
 
 def set_toxic(user_id: int, enabled: bool) -> None:
-    with _lock:
-        _c().execute("UPDATE users SET toxic = ? WHERE user_id = ?", (int(enabled), user_id))
-        _c().commit()
+    set_flag(user_id, "toxic", enabled)
 
 
 def toxic_enabled(user_id: int) -> bool:

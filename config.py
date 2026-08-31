@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import os
-from datetime import timedelta
+from datetime import time, timedelta
 from decimal import Decimal
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -28,6 +28,8 @@ FORCE_IPV6 = os.getenv("SHIFTBOT_FORCE_IPV6", "0").strip().lower() in ("1", "tru
 
 # За сколько часов до начала смены присылать напоминание.
 REMIND_BEFORE = timedelta(hours=float(os.getenv("SHIFTBOT_REMIND_HOURS", "2")))
+# Короткое «пора выходить» — за сколько минут до начала смены.
+LEAVE_BEFORE = timedelta(minutes=int(os.getenv("SHIFTBOT_LEAVE_MIN", "40")))
 # Через сколько после конца смены спрашивать «как прошла».
 CONFIRM_AFTER = timedelta(minutes=int(os.getenv("SHIFTBOT_CONFIRM_AFTER_MIN", "15")))
 
@@ -38,6 +40,38 @@ REMINDER_TICK_MINUTES = int(os.getenv("SHIFTBOT_TICK_MINUTES", "5"))
 WEEKLY_ASK_DOW = os.getenv("SHIFTBOT_ASK_DOW", "sat")  # день недели для cron
 WEEKLY_ASK_HOUR = int(os.getenv("SHIFTBOT_ASK_HOUR", "18"))
 WEEKLY_ASK_MINUTE = int(os.getenv("SHIFTBOT_ASK_MINUTE", "0"))
+
+
+# --- Когда бот молчит и когда пишет --------------------------------------
+
+def _hhmm(raw: str, fallback: time) -> time:
+    """«23:00» -> time(23, 0). Мусор в настройке не должен ронять бота."""
+    try:
+        hh, _, mm = raw.strip().partition(":")
+        return time(int(hh) % 24, int(mm or 0) % 60)
+    except ValueError:
+        return fallback
+
+
+# Тихие часы: в это время бот не пишет ничего, кроме «пора выходить».
+# Начало == конец — тихие часы выключены.
+QUIET_FROM = _hhmm(os.getenv("SHIFTBOT_QUIET_FROM", "23:00"), time(23, 0))
+QUIET_TO = _hhmm(os.getenv("SHIFTBOT_QUIET_TO", "07:00"), time(7, 0))
+
+# Во сколько предупреждать вечером накануне, если «за 2 часа» попадает в тихие часы
+# (1я смена в 06:00 — это 04:00, будить человека незачем).
+EVENING_HOUR = int(os.getenv("SHIFTBOT_EVENING_HOUR", "21"))
+# Во сколько спрашивать про ночную смену: в 06:15 человек идёт спать, а не считать часы.
+NIGHT_CONFIRM_HOUR = int(os.getenv("SHIFTBOT_NIGHT_CONFIRM_HOUR", "14"))
+
+# Ежедневный пинг «есть неподтверждённые смены».
+CONFIRM_PING_HOUR = int(os.getenv("SHIFTBOT_CONFIRM_PING_HOUR", "20"))
+# Понедельничное «пора взять смены на следующую неделю».
+MONDAY_PLAN_HOUR = int(os.getenv("SHIFTBOT_MONDAY_PLAN_HOUR", "10"))
+# Итоги закрытого периода — вечером 1-го числа.
+PERIOD_CLOSE_HOUR = int(os.getenv("SHIFTBOT_PERIOD_CLOSE_HOUR", "20"))
+# Напоминание в день выплаты — утром.
+PAYOUT_HOUR = int(os.getenv("SHIFTBOT_PAYOUT_HOUR", "10"))
 
 # --- Админка --------------------------------------------------------------
 # Пароль для входа в /admin. Пусто — админка выключена совсем.

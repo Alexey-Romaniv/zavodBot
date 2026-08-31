@@ -30,6 +30,9 @@ COMMANDS = [
     BotCommand(command="money", description="Деньги и дата выплаты"),
     BotCommand(command="penalties", description="Штрафы и удержания"),
     BotCommand(command="achievements", description="Достижения и звание"),
+    BotCommand(command="export", description="Выгрузить период файлом"),
+    BotCommand(command="settings", description="Уведомления и тихие часы"),
+    BotCommand(command="mute", description="Помолчать до конца дня"),
     BotCommand(command="help", description="Справка"),
 ]
 

@@ -75,17 +75,83 @@ sudo systemctl restart zavodbot    # перезапуск
 sudo journalctl -u zavodbot -f     # живой лог
 ```
 
-Обновить код после правок на Mac:
+## Обновление кода: автодеплой из GitHub
+
+**Пуш в `main` = обновление бота на VM.** Всё делает
+[.github/workflows/deploy.yml](../.github/workflows/deploy.yml): прогоняет тесты,
+и только если они зелёные — заливает код на сервер и перезапускает бота.
+
+```
+git push origin main
+        │
+        ├─ Тесты (Python 3.11, как в venv на сервере)
+        │
+        └─ Деплой ──► вход в GCP по федерации (без ключей)
+                      git archive → scp через IAP-туннель
+                      deploy/update.sh на сервере
+```
+
+Почему не `git pull` на самой VM: у `github.com` нет IPv6-адресов, а машина живёт
+без внешнего IPv4 — дотянуться до GitHub она не может. Поэтому деплой инициируется
+снаружи: GitHub Actions заходит на VM через IAP-туннель, которому внешний IP не нужен.
+
+### Что делает `update.sh` на сервере
+
+Порядок выбран так, чтобы в любой момент можно было вернуться назад:
+
+1. **бэкап базы** через `sqlite3 .backup` (консистентно даже под работающим ботом),
+   в `/opt/zavodBot/backups/shifts-deploy-*.db`, хранится 14 последних;
+2. **снимок текущего кода** в `/opt/zavodBot.prev`;
+3. **подмена кода** — `.env`, `shifts.db`, `.venv` и `backups/` не трогаются;
+4. **зависимости** — только если изменился `requirements.txt`;
+5. **миграции схемы** (`python migrate.py`) — до перезапуска, чтобы поймать проблему
+   на схеме, а не на упавшем боте;
+6. **перезапуск и проверка**: скрипт ждёт в журнале строку «Бот запущен» — она значит,
+   что токен принят и polling пошёл. `systemctl is-active` для этого недостаточно:
+   systemd считает сервис живым сразу, ещё до того как бот дошёл до Telegram;
+7. **откат при провале** — код возвращается из `.prev`, бот стартует на прежней версии.
+
+Откат безопасен и после миграции: шаги схемы только добавляют таблицы и колонки,
+поэтому прежний код работает с новой схемой (правило из [migrations.py](../migrations.py)).
+
+### Ручной деплой той же логикой
+
+Если нужно залить текущую ветку, не дожидаясь GitHub:
 
 ```bash
-tar --exclude='.venv' --exclude='__pycache__' --exclude='bot.log' --exclude='.env' \
-    --exclude='shifts.db' --exclude='backups' -czf /tmp/z.tar.gz -C ~/Desktop/zavodBot .
-~/google-cloud-sdk/bin/gcloud compute scp --tunnel-through-iap --zone=us-central1-a \
-    /tmp/z.tar.gz zavodbot:/tmp/
-~/google-cloud-sdk/bin/gcloud compute ssh zavodbot --zone=us-central1-a --tunnel-through-iap \
-    --command='sudo tar -xzf /tmp/z.tar.gz -C /opt/zavodBot && \
-               sudo chown -R zavodbot:zavodbot /opt/zavodBot && \
-               sudo systemctl restart zavodbot'
+cd ~/Desktop/zavodBot
+git archive --format=tar.gz -o /tmp/z.tar.gz HEAD
+GC=~/google-cloud-sdk/bin/gcloud
+$GC compute scp /tmp/z.tar.gz zavodbot:/tmp/z.tar.gz \
+    --zone=us-central1-a --tunnel-through-iap
+$GC compute ssh zavodbot --zone=us-central1-a --tunnel-through-iap --command='
+    rm -rf /tmp/zavodbot-new && mkdir -p /tmp/zavodbot-new
+    tar -xzf /tmp/z.tar.gz -C /tmp/zavodbot-new
+    sudo DEPLOY_SHA=$(date +%F-manual) /tmp/zavodbot-new/deploy/update.sh /tmp/zavodbot-new'
+```
+
+`git archive HEAD` берёт только закоммиченное и только то, что в репозитории:
+ни `.env`, ни базы, ни `.venv` туда не попадут в принципе.
+
+### Что настроено в GCP (для справки)
+
+| Что | Значение |
+|---|---|
+| Сервис-аккаунт | `github-deploy@affable-cacao-507022-t2.iam.gserviceaccount.com` |
+| Роли | `iap.tunnelResourceAccessor`, `compute.osAdminLogin`, `compute.viewer` |
+| Пул федерации | `projects/598699870318/locations/global/workloadIdentityPools/github` |
+| Провайдер | `.../providers/zavodbot`, условие `repository == 'Alexey-Romaniv/zavodBot'` |
+| Переменные репозитория | `GCP_WIF_PROVIDER`, `GCP_SERVICE_ACCOUNT` |
+
+Ключей сервис-аккаунта не существует — Actions получает временный токен по OIDC,
+и только из этого репозитория. Красть из GitHub нечего.
+
+Проверить, что доступ жив:
+
+```bash
+gcloud iam workload-identity-pools providers describe zavodbot \
+    --location=global --workload-identity-pool=github
+gh variable list --repo Alexey-Romaniv/zavodBot
 ```
 
 Снятие внешнего IPv4 (уже сделано; имя конфига у GCP — `external-nat`, не «External NAT»):
