@@ -23,13 +23,15 @@ import texts
 # когда бот пришлёт сообщение с новой, поэтому после обновления меню каждому
 # пользователю нужно один раз её досдать — см. middlewares.FreshMenu.
 # Увеличивать при любой правке main_menu().
-MENU_VERSION = 2
+MENU_VERSION = 3
 
-# Подписи кнопок главного меню. Короткие — иначе на телефоне переносятся
-# в две строки и клавиатура выглядит рваной.
+# Подписи кнопок. Короткие — иначе на телефоне переносятся в две строки
+# и клавиатура выглядит рваной. На самой клавиатуре живут только первые
+# четыре, остальное открывается кнопкой «Ещё» — см. main_menu().
 BTN_WEEK = "📅 Смены на неделю"
 BTN_MY = "🗓 Мои смены"
 BTN_MONEY = "💰 Деньги"
+BTN_MORE = "➕ Ещё"
 BTN_MANUAL = "✍️ Вписать смены"
 BTN_ACH = "🏅 Достижения"
 BTN_PENALTY = "⚖️ Штрафы"
@@ -46,6 +48,7 @@ TXT_ACH = frozenset({BTN_ACH})
 TXT_PENALTY = frozenset({BTN_PENALTY})
 TXT_REPORT = frozenset({BTN_REPORT})
 TXT_SETTINGS = frozenset({BTN_SETTINGS})
+TXT_MORE = frozenset({BTN_MORE})
 
 
 class WeekCb(CallbackData, prefix="wk"):
@@ -88,6 +91,10 @@ class SettingsCb(CallbackData, prefix="st"):
     arg: str = ""    # имя тумблера, «22:00-07:00», час или вид тишины
 
 
+class MoreCb(CallbackData, prefix="mr"):
+    action: str      # penalty | ach | manual | report | settings | help | close
+
+
 class AdminCb(CallbackData, prefix="ad"):
     action: str      # menu | stats | users | user | cast | cast_go | logout | close
     arg: str = ""    # user_id для карточки пользователя
@@ -96,20 +103,37 @@ class AdminCb(CallbackData, prefix="ad"):
 def main_menu() -> ReplyKeyboardMarkup:
     """Всё, что нужно, — кнопками: команды набирать не требуется.
 
-    Самое частое действие («записать смены») занимает всю ширину, остальное —
-    парами, чтобы подписи не переносились.
+    Клавиатура постоянная и занимает место под перепиской, поэтому в ней только
+    ежедневное: смены, деньги. Редкое (штрафы, достижения, отчёт, настройки,
+    ручной ввод) прячем за «Ещё» — оно открывается кнопками в сообщении и
+    экран не съедает. Два ряда по две кнопки — подписи не переносятся.
     """
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text=BTN_WEEK)],
-            [KeyboardButton(text=BTN_MY), KeyboardButton(text=BTN_MONEY)],
-            [KeyboardButton(text=BTN_PENALTY), KeyboardButton(text=BTN_ACH)],
-            [KeyboardButton(text=BTN_MANUAL), KeyboardButton(text=BTN_REPORT)],
-            [KeyboardButton(text=BTN_SETTINGS)],
+            [KeyboardButton(text=BTN_WEEK), KeyboardButton(text=BTN_MY)],
+            [KeyboardButton(text=BTN_MONEY), KeyboardButton(text=BTN_MORE)],
         ],
         resize_keyboard=True,
         is_persistent=True,
     )
+
+
+def more_menu() -> InlineKeyboardMarkup:
+    """То, что убрано с клавиатуры: всё остальное, что умеет бот."""
+    kb = InlineKeyboardBuilder()
+    kb.button(text=BTN_PENALTY, callback_data=MoreCb(action="penalty"))
+    kb.button(text=BTN_ACH, callback_data=MoreCb(action="ach"))
+    kb.button(text=BTN_MANUAL, callback_data=MoreCb(action="manual"))
+    kb.button(text=BTN_REPORT, callback_data=MoreCb(action="report"))
+    kb.button(text=BTN_SETTINGS, callback_data=MoreCb(action="settings"))
+    kb.button(text="❓ Что умеет бот", callback_data=MoreCb(action="help"))
+    kb.adjust(2)
+    kb.row(
+        InlineKeyboardButton(
+            text="✖️ Закрыть", callback_data=MoreCb(action="close").pack()
+        )
+    )
+    return kb.as_markup()
 
 
 WEEK_NAMES = {-7: "прошлая", 0: "эта", 7: "следующая", 14: "через неделю"}
