@@ -39,6 +39,23 @@ COMMANDS = [
 ]
 
 
+def build_dispatcher() -> Dispatcher:
+    """Собрать Dispatcher: роутеры и промежуточные слои.
+
+    Отдельной функцией, чтобы тесты маршрутизации проверяли ту же сборку,
+    что работает в бою: порядок роутеров тут значим — апдейт достаётся первому
+    роутеру, чей хендлер его взял, а не самому конкретному фильтру.
+    """
+    dp = Dispatcher(storage=MemoryStorage())
+    dp.update.outer_middleware(middlewares.RememberUser())
+    dp.message.middleware(middlewares.FreshMenu())
+    # Админка первой: её шаги ввода (пароль, текст рассылки) должны опережать
+    # общий разбор текста в handlers.
+    dp.include_router(handlers_admin.router)
+    dp.include_router(handlers.router)
+    return dp
+
+
 class IPv6OnlySession(AiohttpSession):
     """Сессия, которая соединяется с Telegram только по IPv6.
 
@@ -65,11 +82,7 @@ async def main() -> None:
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
         session=session,
     )
-    dp = Dispatcher(storage=MemoryStorage())
-    dp.update.outer_middleware(middlewares.RememberUser())
-    dp.message.middleware(middlewares.FreshMenu())
-    dp.include_router(handlers.router)
-    dp.include_router(handlers_admin.router)
+    dp = build_dispatcher()
 
     sched = scheduler.setup(bot)
     sched.start()

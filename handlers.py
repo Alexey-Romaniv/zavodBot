@@ -7,7 +7,7 @@ from decimal import Decimal
 
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
@@ -1137,12 +1137,14 @@ async def cb_confirm_halves(call: CallbackQuery, callback_data: kb.ConfirmCb) ->
 
 # --- Текст, набранный по привычке -----------------------------------------
 
-@router.message(F.text, ~F.text.startswith("/"))
+@router.message(StateFilter(None), F.text, ~F.text.startswith("/"))
 async def on_loose_text(message: Message, state: FSMContext) -> None:
     """Всё в боте делается кнопками, но набранное руками «5.08 1» тоже поймём.
 
-    Стоит последним: сюда попадает только то, что не разобрали ни кнопки меню,
-    ни активный шаг ввода.
+    StateFilter(None) обязателен: без него этот хендлер перехватывает текст,
+    которого ждёт шаг ввода из другого роутера — например пароль админки или
+    текст рассылки, — потому что между роутерами апдейт достаётся первому,
+    кто его взял, а не самому конкретному фильтру.
     """
     db.ensure_user(message.from_user.id)
     year, month = domain.period_anchor(domain.today())

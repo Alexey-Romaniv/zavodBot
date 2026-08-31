@@ -245,6 +245,7 @@ GitHub Actions прогоняет тесты, заливает код через
 | `test_domain.py` | тесты логики: `.venv/bin/python test_domain.py` |
 | `test_achievements.py` | тесты достижений: `.venv/bin/python test_achievements.py` |
 | `test_penalties.py` | тесты штрафов: `.venv/bin/python test_penalties.py` |
+| `test_routing.py` | тесты маршрутизации: чей хендлер получит сообщение |
 | `test_admin.py` | тесты админки: `.venv/bin/python test_admin.py` |
 | `test_notify.py` | тесты уведомлений и выгрузки: `.venv/bin/python test_notify.py` |
 | `test_ui.py` | тесты клавиатур и лимитов Telegram: `.venv/bin/python test_ui.py` |
