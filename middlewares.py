@@ -66,7 +66,7 @@ class FreshMenu(BaseMiddleware):
                 return result
             db.set_menu_version(user.id, kb.MENU_VERSION)
             await message.answer(
-                "⌨️ Кнопки обновились — теперь тут же настройки и отчёт.",
+                "⌨️ Кнопки обновились: меню стало компактнее, редкое — под «➕ Ещё».",
                 reply_markup=kb.main_menu(),
             )
         except Exception:  # не даём сбою досылки сломать сам ответ бота

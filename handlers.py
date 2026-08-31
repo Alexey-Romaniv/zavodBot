@@ -10,7 +10,12 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import BufferedInputFile, CallbackQuery, Message
+from aiogram.types import (
+    BufferedInputFile,
+    CallbackQuery,
+    InlineKeyboardMarkup,
+    Message,
+)
 
 import achievements
 import config
@@ -76,14 +81,18 @@ async def award(target: Message | CallbackQuery, user_id: int) -> None:
         await chat.answer(reports.lost_message(lost, tone))
 
 
+def _achievements_text(user_id: int) -> str:
+    db.log_event(user_id, "ach_view")
+    db.mark_ach_intro(user_id)  # список и есть сводка, отдельная не нужна
+    return reports.achievements_report(user_id)
+
+
 @router.message(Command("achievements"))
 @router.message(F.text.in_(kb.TXT_ACH))
 async def cmd_achievements(message: Message, state: FSMContext) -> None:
     await state.clear()
     db.ensure_user(message.from_user.id)
-    db.log_event(message.from_user.id, "ach_view")
-    db.mark_ach_intro(message.from_user.id)  # список и есть сводка, отдельная не нужна
-    await message.answer(reports.achievements_report(message.from_user.id))
+    await message.answer(_achievements_text(message.from_user.id))
 
 
 @router.message(Command("toxic_on"))
@@ -588,16 +597,21 @@ async def cmd_export(message: Message, state: FSMContext) -> None:
     await _send_export(message, message.from_user.id, year, month)
 
 
+def _period_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    """Отчёт за текущий период: список в чат, файл — кнопкой под ним."""
+    year, month = domain.period_anchor(domain.today())
+    return (
+        exporting.period_text(user_id, year, month),
+        kb.money_nav(user_id, year, month),
+    )
+
+
 @router.message(F.text.in_(kb.TXT_REPORT))
 async def btn_report(message: Message, state: FSMContext) -> None:
-    """Отчёт за период: сначала списком в чат, файл — кнопкой под ним."""
     await state.clear()
     db.ensure_user(message.from_user.id)
-    year, month = domain.period_anchor(domain.today())
-    await message.answer(
-        exporting.period_text(message.from_user.id, year, month),
-        reply_markup=kb.money_nav(message.from_user.id, year, month),
-    )
+    text, markup = _period_view(message.from_user.id)
+    await message.answer(text, reply_markup=markup)
 
 
 @router.callback_query(kb.MoneyCb.filter(F.action == "export"))
@@ -765,14 +779,19 @@ async def on_penalty_entry(message: Message, state: FSMContext) -> None:
 
 # --- Вписать смены за прошлые дни -----------------------------------------
 
+def _manual_view() -> tuple[str, InlineKeyboardMarkup]:
+    """Смены задним числом — кнопками: месяц, смена, дни. Ничего писать не нужно."""
+    year, month = domain.period_anchor(domain.today())
+    return _manual_intro(year, month), kb.manual_shift_choice(year, month)
+
+
 @router.message(Command("add"))
 @router.message(F.text.in_(kb.TXT_MANUAL))
 async def cmd_add(message: Message, state: FSMContext) -> None:
-    """Смены задним числом — кнопками: месяц, смена, дни. Ничего писать не нужно."""
     await state.clear()
     db.ensure_user(message.from_user.id)
-    year, month = domain.period_anchor(domain.today())
-    await message.answer(_manual_intro(year, month), reply_markup=kb.manual_shift_choice(year, month))
+    text, markup = _manual_view()
+    await message.answer(text, reply_markup=markup)
 
 
 def _manual_intro(year: int, month: int) -> str:
@@ -912,6 +931,44 @@ async def cb_manual_stale(call: CallbackQuery) -> None:
         "Это сообщение устарело — выбор сбросился. Начни заново: «✍️ Вписать смены»."
     )
     await call.answer("Сообщение устарело", show_alert=True)
+
+
+# --- Ещё ------------------------------------------------------------------
+
+@router.message(F.text.in_(kb.TXT_MORE))
+async def btn_more(message: Message, state: FSMContext) -> None:
+    """Редкие разделы: на постоянной клавиатуре они только занимали экран."""
+    await state.clear()
+    db.ensure_user(message.from_user.id)
+    await message.answer(texts.MORE_TITLE, reply_markup=kb.more_menu())
+
+
+@router.callback_query(kb.MoreCb.filter())
+async def cb_more(call: CallbackQuery, callback_data: kb.MoreCb, state: FSMContext) -> None:
+    """Открываем раздел прямо в этом сообщении — чтобы меню не копилось в чате."""
+    await state.clear()
+    user_id = call.from_user.id
+    db.ensure_user(user_id)
+    action = callback_data.action
+
+    if action == "penalty":
+        year, month = domain.period_anchor(domain.today())
+        await _show_penalties(call, year, month, edit=True)
+    elif action == "ach":
+        # Список достижений длинный и упирается в лимит Telegram на правку —
+        # отдельным сообщением он дойдёт целиком.
+        await call.message.answer(_achievements_text(user_id))
+    elif action == "manual":
+        await _edit(call, *_manual_view())
+    elif action == "report":
+        await _edit(call, *_period_view(user_id))
+    elif action == "settings":
+        await _show_settings(call)
+    elif action == "help":
+        await _edit(call, texts.HELP, None)
+    else:  # close
+        await _edit(call, texts.MORE_CLOSED, None)
+    await call.answer()
 
 
 # --- Подтверждение прошедших смен ------------------------------------------

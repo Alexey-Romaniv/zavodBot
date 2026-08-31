@@ -46,19 +46,27 @@ def sample_user() -> int:
 
 # --- Главное меню ---------------------------------------------------------
 
-def test_main_menu_covers_everything_without_commands():
+def test_main_menu_is_small_and_covers_everything():
+    """Клавиатура ест экран, поэтому на ней только ежедневное, остальное — «Ещё»."""
     menu = kb.main_menu()
     rows = [[b.text for b in row] for row in menu.keyboard]
     flat = [text for row in rows for text in row]
-    # всё, что делает бот, доступно кнопкой — команды набирать не нужно
-    for expected in (kb.BTN_WEEK, kb.BTN_MY, kb.BTN_MONEY, kb.BTN_PENALTY,
-                     kb.BTN_ACH, kb.BTN_MANUAL, kb.BTN_REPORT, kb.BTN_SETTINGS):
-        assert expected in flat, expected
+    assert flat == [kb.BTN_WEEK, kb.BTN_MY, kb.BTN_MONEY, kb.BTN_MORE], flat
     assert menu.resize_keyboard and menu.is_persistent
-    # не больше двух кнопок в ряду, иначе подписи переносятся
-    assert all(len(row) <= 2 for row in rows), rows
-    # самое частое действие — отдельным рядом во всю ширину
-    assert rows[0] == [kb.BTN_WEEK]
+    # не больше двух рядов по две кнопки: иначе меню закрывает переписку
+    assert len(rows) <= 2 and all(len(row) <= 2 for row in rows), rows
+
+
+def test_more_menu_has_everything_left_off_the_keyboard():
+    """Всё, что делает бот, доступно кнопкой — команды набирать не нужно."""
+    markup = kb.more_menu()
+    check_limits(markup, "more")
+    labels = texts_of(markup)
+    for expected in (kb.BTN_PENALTY, kb.BTN_ACH, kb.BTN_MANUAL,
+                     kb.BTN_REPORT, kb.BTN_SETTINGS):
+        assert expected in labels, expected
+    actions = {b.callback_data.split(":")[1] for b in buttons(markup)}
+    assert "close" in actions
 
 
 def test_old_button_labels_still_accepted():
