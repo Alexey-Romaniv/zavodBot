@@ -138,7 +138,8 @@ $GC compute ssh zavodbot --zone=us-central1-a --tunnel-through-iap --command='
 | Что | Значение |
 |---|---|
 | Сервис-аккаунт | `github-deploy@affable-cacao-507022-t2.iam.gserviceaccount.com` |
-| Роли | `iap.tunnelResourceAccessor`, `compute.osAdminLogin`, `compute.viewer` |
+| Роли в проекте | `iap.tunnelResourceAccessor`, `compute.osAdminLogin`, `compute.viewer` |
+| Ещё одна роль | `iam.serviceAccountUser` — точечно на SA инстанса `598699870318-compute@developer.gserviceaccount.com`: `gcloud compute ssh/scp` без неё отвечает `PERMISSION_DENIED: ... actAs` |
 | Пул федерации | `projects/598699870318/locations/global/workloadIdentityPools/github` |
 | Провайдер | `.../providers/zavodbot`, условие `repository == 'Alexey-Romaniv/zavodBot'` |
 | Переменные репозитория | `GCP_WIF_PROVIDER`, `GCP_SERVICE_ACCOUNT` |

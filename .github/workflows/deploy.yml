@@ -65,21 +65,25 @@ jobs:
 
       - name: Залить архив на VM
         run: |
+          # Имя с хэшем коммита: в /tmp может лежать чужой файл от ручного деплоя,
+          # а перезаписать его нельзя — /tmp со sticky-битом.
           gcloud compute scp /tmp/zavodbot-deploy.tar.gz \
-            "${VM_NAME}:/tmp/zavodbot-deploy.tar.gz" \
+            "${VM_NAME}:/tmp/zavodbot-${{ github.sha }}.tar.gz" \
             --zone="$GCP_ZONE" --project="$GCP_PROJECT" --tunnel-through-iap --quiet
 
       - name: Обновить и перезапустить бота
         run: |
           # Распаковываем и запускаем update.sh из нового кода: правки деплоя
           # применяются в этом же прогоне, а не в следующем.
+          # Каталог свой на каждый прогон — иначе остатки чужого деплоя не удалить.
           gcloud compute ssh "$VM_NAME" \
             --zone="$GCP_ZONE" --project="$GCP_PROJECT" --tunnel-through-iap --quiet \
             --command="set -e
-              rm -rf /tmp/zavodbot-new && mkdir -p /tmp/zavodbot-new
-              tar -xzf /tmp/zavodbot-deploy.tar.gz -C /tmp/zavodbot-new
-              sudo DEPLOY_SHA=${{ github.sha }} /tmp/zavodbot-new/deploy/update.sh /tmp/zavodbot-new
-              rm -rf /tmp/zavodbot-new /tmp/zavodbot-deploy.tar.gz"
+              ARCHIVE=/tmp/zavodbot-${{ github.sha }}.tar.gz
+              NEW=\$(mktemp -d /tmp/zavodbot-new.XXXXXX)
+              trap 'sudo rm -rf \$NEW \$ARCHIVE' EXIT
+              tar -xzf \$ARCHIVE -C \$NEW
+              sudo DEPLOY_SHA=${{ github.sha }} \$NEW/deploy/update.sh \$NEW"
 
       - name: Состояние сервиса
         if: always()
