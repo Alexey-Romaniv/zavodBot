@@ -68,6 +68,23 @@ def parse_entries(
     return sorted(entries.keys()), errors
 
 
+# «4520», «4 520,35», «4520.35 zl» — сумма фактической выплаты.
+AMOUNT_RE = re.compile(r"^\s*(?P<n>\d{1,3}(?:[ \u00a0]?\d{3})*(?:[.,]\d{1,2})?)\s*\D{0,4}\s*$")
+
+
+def parse_amount(text: str) -> Decimal | None:
+    """Разобрать сумму, как её пишут люди: с пробелами, запятой и «zł» в конце."""
+    m = AMOUNT_RE.match(text)
+    if not m:
+        return None
+    raw = m.group("n").replace(" ", "").replace("\u00a0", "").replace(",", ".")
+    try:
+        value = Decimal(raw)
+    except InvalidOperation:
+        return None
+    return value if value >= 0 else None
+
+
 # --- Штрафы ---------------------------------------------------------------
 
 # Слова, по которым узнаём вид нарушения. Хватает начала слова.

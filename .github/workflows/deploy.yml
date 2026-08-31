@@ -1,0 +1,89 @@
+name: Тесты и деплой
+
+# Пуш в main = обновление бота на VM. Ручной запуск (Actions → Run workflow)
+# обновляет ту ветку, из которой запущен, — так удобно проверять деплой перед мержем.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  # два деплоя одновременно означали бы два процесса на одном токене Telegram
+  group: deploy-zavodbot
+  cancel-in-progress: false
+
+env:
+  GCP_PROJECT: affable-cacao-507022-t2
+  GCP_ZONE: us-central1-a
+  VM_NAME: zavodbot
+
+jobs:
+  tests:
+    name: Тесты
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          # та же версия, что в venv на сервере, — иначе тесты проверяют не то
+          python-version: "3.11"
+      - name: Зависимости
+        run: pip install --quiet -r requirements.txt
+      - name: Прогон тестов
+        run: |
+          failed=0
+          for t in test_*.py; do
+            echo "── $t"
+            python "$t" || failed=1
+          done
+          exit $failed
+
+  deploy:
+    name: Деплой на VM
+    needs: tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write        # нужен для федерации: GitHub выдаёт OIDC-токен, GCP его принимает
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Вход в GCP
+        uses: google-github-actions/auth@v2
+        with:
+          # Долгоживущего ключа нет: доступ выдаётся только этому репозиторию
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Собрать архив с кодом
+        run: |
+          # git archive берёт только то, что в репозитории: ни .env, ни базы, ни .venv
+          git archive --format=tar.gz -o /tmp/zavodbot-deploy.tar.gz HEAD
+          ls -lh /tmp/zavodbot-deploy.tar.gz
+
+      - name: Залить архив на VM
+        run: |
+          gcloud compute scp /tmp/zavodbot-deploy.tar.gz \
+            "${VM_NAME}:/tmp/zavodbot-deploy.tar.gz" \
+            --zone="$GCP_ZONE" --project="$GCP_PROJECT" --tunnel-through-iap --quiet
+
+      - name: Обновить и перезапустить бота
+        run: |
+          # Распаковываем и запускаем update.sh из нового кода: правки деплоя
+          # применяются в этом же прогоне, а не в следующем.
+          gcloud compute ssh "$VM_NAME" \
+            --zone="$GCP_ZONE" --project="$GCP_PROJECT" --tunnel-through-iap --quiet \
+            --command="set -e
+              rm -rf /tmp/zavodbot-new && mkdir -p /tmp/zavodbot-new
+              tar -xzf /tmp/zavodbot-deploy.tar.gz -C /tmp/zavodbot-new
+              sudo DEPLOY_SHA=${{ github.sha }} /tmp/zavodbot-new/deploy/update.sh /tmp/zavodbot-new
+              rm -rf /tmp/zavodbot-new /tmp/zavodbot-deploy.tar.gz"
+
+      - name: Состояние сервиса
+        if: always()
+        run: |
+          gcloud compute ssh "$VM_NAME" \
+            --zone="$GCP_ZONE" --project="$GCP_PROJECT" --tunnel-through-iap --quiet \
+            --command="systemctl is-active zavodbot && sudo journalctl -u zavodbot -n 15 --no-pager"

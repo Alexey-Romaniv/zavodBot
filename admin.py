@@ -16,6 +16,7 @@ import config
 import db
 import domain
 import reports
+import texts
 
 log = logging.getLogger(__name__)
 
@@ -365,9 +366,18 @@ def user_card(user_id: int, users: list[UserStat] | None = None) -> str:
         lines.append(f"    удержания: −{domain.money(period.deductions)}")
     lines.append(f"    на руки: <b>{domain.money(period.net)}</b>")
     lines.append("")
-    lines.append(
-        "<i>Настройки: еженедельный вопрос — "
-        f"{'вкл' if u.weekly_ask else 'выкл'}, тон — "
-        f"{'стёб' if u.toxic else 'по-доброму'}.</i>"
+    prefs = db.prefs(u.user_id)
+    off = [
+        title for flag, _, title, _, _ in texts.PREF_LABELS
+        if flag != "toxic" and not getattr(prefs, flag)
+    ]
+    settings = (
+        f"тон — {'стёб' if prefs.toxic else 'по-доброму'},"
+        f" тихие часы — {prefs.quiet_label},"
+        f" вечернее напоминание — {prefs.evening_hour:02d}:00."
     )
+    settings += (" Выключено: " + ", ".join(off) + ".") if off else " Уведомления все включены."
+    if prefs.muted_until is not None:
+        settings += f" 🔇 Тишина до {prefs.muted_until:%d.%m %H:%M}."
+    lines.append(f"<i>Настройки: {settings}</i>")
     return "\n".join(lines)

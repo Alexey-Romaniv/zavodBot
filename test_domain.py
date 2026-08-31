@@ -12,6 +12,7 @@ os.environ.setdefault("SHIFTBOT_DB", os.path.join(tempfile.mkdtemp(), "test.db")
 import config  # noqa: E402
 import db  # noqa: E402
 import domain  # noqa: E402
+import notify  # noqa: E402
 import parsing  # noqa: E402
 
 
@@ -21,8 +22,8 @@ def test_shift_times():
     assert domain.shift_end(d, 1).hour == 14
     assert domain.shift_start(d, 3) == datetime(2026, 8, 28, 22, 0, tzinfo=config.TZ)
     assert domain.shift_end(d, 3) == datetime(2026, 8, 29, 6, 0, tzinfo=config.TZ)
-    # напоминание за 2 часа
-    assert domain.remind_at(d, 2) == datetime(2026, 8, 28, 12, 0, tzinfo=config.TZ)
+    # напоминание за 2 часа (умное время живёт в notify — см. test_notify.py)
+    assert notify.remind_at(notify.Prefs(), d, 2) == datetime(2026, 8, 28, 12, 0, tzinfo=config.TZ)
 
 
 def test_rates():

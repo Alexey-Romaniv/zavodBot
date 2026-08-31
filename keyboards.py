@@ -15,6 +15,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 import config
 import db
 import domain
+import texts
 
 BTN_WEEK = "📅 Смены на неделю"
 BTN_MY = "🗓 Мои смены"
@@ -42,13 +43,20 @@ class ConfirmCb(CallbackData, prefix="cf"):
 
 
 class MoneyCb(CallbackData, prefix="mn"):
-    ym: str  # YYYY-MM месяца-якоря периода
+    ym: str          # YYYY-MM месяца-якоря периода
+    action: str = "nav"  # nav | payout | check | payout_del | export
 
 
 class PenaltyCb(CallbackData, prefix="pn"):
     action: str      # nav | menu | kind | del | ratecut | close
     ym: str = ""     # YYYY-MM периода, к которому относится действие
     arg: str = ""    # код вида нарушения или id штрафа
+
+
+class SettingsCb(CallbackData, prefix="st"):
+    action: str      # menu | toggle | quiet | quiet_set | evening | evening_set
+                     # | mute | mute_set | unmute | close
+    arg: str = ""    # имя тумблера, «22:00-07:00», час или вид тишины
 
 
 class AdminCb(CallbackData, prefix="ad"):
@@ -70,10 +78,14 @@ def main_menu() -> ReplyKeyboardMarkup:
 WEEK_NAMES = {-7: "прошлая", 0: "эта", 7: "следующая", 14: "через неделю"}
 
 
-def week_choice() -> InlineKeyboardMarkup:
-    """Недели с явными датами: самая уместная сейчас — первой кнопкой."""
+def week_choice(preferred: date | None = None) -> InlineKeyboardMarkup:
+    """Недели с явными датами: самая уместная сейчас — первой кнопкой.
+
+    `preferred` задаёт эту неделю вручную: понедельничное напоминание про
+    следующую неделю не должно предлагать первой уже начавшуюся.
+    """
     base = domain.monday_of(domain.today())
-    plan = domain.planning_monday()
+    plan = preferred or domain.planning_monday()
     offsets = [0, 7, -7] if plan == base else [7, 14, 0]
     kb = InlineKeyboardBuilder()
     for off in offsets:
@@ -157,9 +169,12 @@ def restore(shift_id: int) -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 
-def money_nav(year: int, month: int) -> InlineKeyboardMarkup:
+def money_nav(user_id: int, year: int, month: int) -> InlineKeyboardMarkup:
+    """Месяцы, отметка фактической выплаты и выгрузка периода в файл."""
+    ym = f"{year}-{month:02d}"
     py, pm = domain.prev_month(year, month)
     ny, nm = domain.next_month(year, month)
+    paid = db.get_payout(user_id, year, month)
     kb = InlineKeyboardBuilder()
     kb.row(
         InlineKeyboardButton(
@@ -169,6 +184,48 @@ def money_nav(year: int, month: int) -> InlineKeyboardMarkup:
             text=f"{domain.MONTHS_NOM[nm - 1]} ▶️", callback_data=MoneyCb(ym=f"{ny}-{nm:02d}").pack()
         ),
     )
+    if paid is None:
+        kb.row(
+            InlineKeyboardButton(
+                text="💳 Пришла выплата — сверить",
+                callback_data=MoneyCb(ym=ym, action="payout").pack(),
+            )
+        )
+    else:
+        kb.row(
+            InlineKeyboardButton(
+                text=f"💳 Сверка: {domain.money(paid)}",
+                callback_data=MoneyCb(ym=ym, action="check").pack(),
+            )
+        )
+        kb.row(
+            InlineKeyboardButton(
+                text="✏️ Изменить сумму",
+                callback_data=MoneyCb(ym=ym, action="payout").pack(),
+            ),
+            InlineKeyboardButton(
+                text="🗑 Убрать",
+                callback_data=MoneyCb(ym=ym, action="payout_del").pack(),
+            ),
+        )
+    kb.row(
+        InlineKeyboardButton(
+            text="📄 Выгрузить период в файл",
+            callback_data=MoneyCb(ym=ym, action="export").pack(),
+        )
+    )
+    return kb.as_markup()
+
+
+def payout_ask(year: int, month: int) -> InlineKeyboardMarkup:
+    """Кнопка из напоминания в день выплаты."""
+    ym = f"{year}-{month:02d}"
+    kb = InlineKeyboardBuilder()
+    kb.button(
+        text="💳 Ввести фактическую сумму", callback_data=MoneyCb(ym=ym, action="payout")
+    )
+    kb.button(text="💰 Отчёт за период", callback_data=MoneyCb(ym=ym))
+    kb.adjust(1)
     return kb.as_markup()
 
 
@@ -303,6 +360,94 @@ def penalty_kinds(ym: str) -> InlineKeyboardMarkup:
         )
     kb.button(text="⬅️ Назад", callback_data=PenaltyCb(action="nav", ym=ym))
     kb.adjust(1)
+    return kb.as_markup()
+
+
+# --- Настройки ------------------------------------------------------------
+
+# Варианты тихих часов: «начало-конец» в целых часах либо off — совсем без тишины.
+# Двоеточие в callback_data — разделитель самого aiogram, поэтому только часы.
+QUIET_PRESETS = ((22, 7), (23, 7), (23, 8), (0, 8))
+# Во сколько предупреждать вечером накануне утренней смены.
+EVENING_PRESETS = (18, 19, 20, 21, 22)
+
+
+def settings_menu(prefs) -> InlineKeyboardMarkup:
+    """Все настройки одним экраном: нажатие переключает и перерисовывает меню."""
+    kb = InlineKeyboardBuilder()
+    for flag, icon, title, on, off in texts.PREF_LABELS:
+        state = on if getattr(prefs, flag) else off
+        mark = "✅" if getattr(prefs, flag) else "❌"
+        kb.button(
+            text=f"{mark} {icon} {title}: {state}",
+            callback_data=SettingsCb(action="toggle", arg=flag),
+        )
+    kb.button(
+        text=f"🌙 Тихие часы: {prefs.quiet_label}",
+        callback_data=SettingsCb(action="quiet"),
+    )
+    kb.button(
+        text=f"🌆 Вечером накануне: {prefs.evening_hour:02d}:00",
+        callback_data=SettingsCb(action="evening"),
+    )
+    if prefs.muted_until is not None:
+        kb.button(
+            text=f"🔔 Снять тишину (до {prefs.muted_until:%H:%M})",
+            callback_data=SettingsCb(action="unmute"),
+        )
+    else:
+        kb.button(text="🔇 Тишина до конца дня", callback_data=SettingsCb(action="mute"))
+    kb.button(text="✖️ Закрыть", callback_data=SettingsCb(action="close"))
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def quiet_choice(prefs) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    for start, end in QUIET_PRESETS:
+        current = (
+            not prefs.quiet_off
+            and (prefs.quiet_from.hour, prefs.quiet_from.minute) == (start, 0)
+            and (prefs.quiet_to.hour, prefs.quiet_to.minute) == (end, 0)
+        )
+        kb.button(
+            text=("• " if current else "") + f"{start:02d}:00–{end:02d}:00",
+            callback_data=SettingsCb(action="quiet_set", arg=f"{start}-{end}"),
+        )
+    kb.button(
+        text=("• " if prefs.quiet_off else "") + "Без тихих часов",
+        callback_data=SettingsCb(action="quiet_set", arg="off"),
+    )
+    kb.button(text="⬅️ Назад", callback_data=SettingsCb(action="menu"))
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def evening_choice(prefs) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    for hour in EVENING_PRESETS:
+        kb.button(
+            text=("• " if hour == prefs.evening_hour else "") + f"{hour:02d}:00",
+            callback_data=SettingsCb(action="evening_set", arg=str(hour)),
+        )
+    kb.adjust(3)
+    kb.row(
+        InlineKeyboardButton(
+            text="⬅️ Назад", callback_data=SettingsCb(action="menu").pack()
+        )
+    )
+    return kb.as_markup()
+
+
+def mute_menu(prefs) -> InlineKeyboardMarkup:
+    """Насколько замолчать. «Пора выходить» приходит всё равно — это будильник."""
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🌅 До утра", callback_data=SettingsCb(action="mute_set", arg="morning"))
+    kb.button(text="🌘 На сутки", callback_data=SettingsCb(action="mute_set", arg="24h"))
+    if prefs.muted_until is not None:
+        kb.button(text="🔔 Снять тишину", callback_data=SettingsCb(action="unmute"))
+    kb.button(text="⚙️ Все настройки", callback_data=SettingsCb(action="menu"))
+    kb.adjust(2)
     return kb.as_markup()
 
 

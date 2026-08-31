@@ -1,6 +1,8 @@
-"""Сборка текстовых отчётов: неделя, предстоящие смены, деньги за период."""
+"""Сборка отчётов: неделя, предстоящие смены, деньги за период, выгрузка в CSV."""
 from __future__ import annotations
 
+import csv
+import io
 from dataclasses import dataclass
 from datetime import date, timedelta
 from decimal import Decimal
@@ -199,6 +201,7 @@ def money_report(user_id: int, year: int, month: int) -> str:
     lines.append(
         f"\n🗓 Выплата: <b>{domain.fmt_date_long(domain.payout_date(year, month))}</b>"
     )
+    lines += payout_lines(user_id, period)
     lines.append(
         f"<i>Ставки: день {domain.money(config.DAY_RATE)}/час, "
         f"ночь {domain.money(config.NIGHT_RATE)}/час.</i>"
@@ -297,6 +300,330 @@ def penalties_report(user_id: int, year: int, month: int) -> tuple[str, Period]:
             " так что итог приблизительный.</i>"
         )
     return "\n".join(lines), period
+
+
+# --- Фактическая выплата ---------------------------------------------------
+
+# Меньше этой разницы считаем совпадением: округления в расчётке неизбежны.
+PAYOUT_EPS = Decimal("0.50")
+
+
+def payout_lines(user_id: int, period: Period) -> list[str]:
+    """Строки сверки для /money — только если фактическая выплата отмечена."""
+    actual = db.get_payout(user_id, period.year, period.month)
+    if actual is None:
+        return []
+    diff = actual - period.net
+    out = [f"💳 Пришло: <b>{domain.money(actual)}</b>"]
+    if abs(diff) <= PAYOUT_EPS:
+        out.append("    <i>сходится с расчётом ✅</i>")
+    else:
+        word = "больше" if diff > 0 else "меньше"
+        out.append(
+            f"    <i>расчёт {domain.money(period.net)} —"
+            f" на {domain.money(abs(diff))} {word}</i>"
+        )
+    return out
+
+
+def payout_check(user_id: int, year: int, month: int) -> str:
+    """Подробная сверка: что бот насчитал против того, что реально пришло."""
+    period = period_data(user_id, year, month)
+    actual = db.get_payout(user_id, year, month)
+    if actual is None:
+        return f"За {domain.period_title(year, month)} фактическая выплата не отмечена."
+    diff = actual - period.net
+    lines = [
+        f"<b>💳 Сверка: {domain.period_title(year, month)}</b>",
+        f"<i>выплата {domain.fmt_date_long(domain.payout_date(year, month))}</i>",
+        "",
+        f"Заработано по моему расчёту: {domain.money(period.earned)}",
+    ]
+    if period.deductions:
+        lines += deduction_lines(period)
+    lines += [
+        f"📊 Должно было прийти: <b>{domain.money(period.net)}</b>",
+        f"💳 Пришло фактически: <b>{domain.money(actual)}</b>",
+        "",
+    ]
+    if abs(diff) <= PAYOUT_EPS:
+        lines.append("✅ <b>Сходится.</b> Завод посчитал так же, как и я.")
+    else:
+        word = "больше" if diff > 0 else "меньше"
+        lines.append(f"⚠️ <b>Разница: {domain.money(abs(diff))}</b> — пришло {word}.")
+        if period.unconfirmed:
+            lines.append(
+                f"Часть разницы может быть отсюда: {len(period.unconfirmed)}"
+                f" {domain.shifts_word(len(period.unconfirmed))} без подтверждения"
+                " я считаю по 8 ч — уточни /confirm."
+            )
+        lines.append(
+            "<i>Мой расчёт — брутто по ставке, а штрафы по договору — нетто,"
+            " поэтому расхождение в пределах налогов и округлений нормально."
+            " Большая разница — повод идти в отдел кадров с выгрузкой:</i> /export"
+        )
+    return "\n".join(lines)
+
+
+# --- Настройки -------------------------------------------------------------
+
+def settings_report(user_id: int) -> str:
+    """Что бот присылает сам и в какое время — с учётом настроек этого человека."""
+    prefs = db.prefs(user_id)
+    remind_hours = config.REMIND_BEFORE.total_seconds() / 3600
+    remind = f"{remind_hours:g}".replace(".", ",")
+    lines = [
+        "⚙️ <b>Настройки</b>",
+        "",
+        "<b>Что приходит само:</b>",
+        f"• напоминание о смене — за {remind} ч до начала,"
+        f" а если это ночь, то вечером накануне в {prefs.evening_hour:02d}:00",
+        f"• «пора выходить» — за {int(config.LEAVE_BEFORE.total_seconds() // 60)} мин"
+        " до начала" + ("" if prefs.leave_ping else " <i>(выключено)</i>"),
+        f"• «сколько часов зачли» — через"
+        f" {int(config.CONFIRM_AFTER.total_seconds() // 60)} мин после смены,"
+        f" после ночной — в {config.NIGHT_CONFIRM_HOUR:02d}:00",
+    ]
+    if prefs.weekly_ask:
+        lines.append(
+            f"• вопрос «какие смены на этой неделе» — {domain.WEEKDAY_SHORT[5]}"
+            f" в {config.WEEKLY_ASK_HOUR:02d}:{config.WEEKLY_ASK_MINUTE:02d}"
+        )
+    if prefs.monday_plan:
+        lines.append(
+            "• «пора взять смены на следующую неделю» —"
+            f" {domain.WEEKDAY_SHORT[0]} в {config.MONDAY_PLAN_HOUR:02d}:00"
+        )
+    if prefs.confirm_ping:
+        lines.append(
+            "• пинг про неподтверждённые смены —"
+            f" ежедневно в {config.CONFIRM_PING_HOUR:02d}:00"
+        )
+    if prefs.period_news:
+        lines.append(
+            f"• итоги периода — 1-го числа в {config.PERIOD_CLOSE_HOUR:02d}:00,"
+            f" напоминание о выплате — в её день в {config.PAYOUT_HOUR:02d}:00"
+        )
+    lines.append("")
+    if prefs.quiet_off:
+        lines.append("🌙 Тихие часы выключены — бот может написать в любое время.")
+    else:
+        lines.append(
+            f"🌙 Тихие часы: <b>{prefs.quiet_label}</b> — в это время бот молчит."
+            " Пробивает их только «пора выходить»."
+        )
+    if prefs.muted_until is not None:
+        lines.append(
+            f"🔇 Тишина включена до <b>{prefs.muted_until:%H:%M}</b>"
+            f" ({domain.fmt_date(prefs.muted_until.date())})."
+        )
+    return "\n".join(lines)
+
+
+# --- Уведомления по расписанию --------------------------------------------
+
+def monday_plan_message(user_id: int) -> str | None:
+    """Понедельничное «пора взять смены на следующую неделю».
+
+    Если на следующую неделю уже что-то записано — человек её спланировал, молчим.
+    """
+    monday = domain.monday_of(domain.today()) + timedelta(days=7)
+    start = monday - timedelta(days=1)   # ночная с Вс относится к этой неделе
+    if db.shifts_in_range(user_id, start, monday + timedelta(days=6)):
+        return None
+    return (
+        "📅 <b>Пора взять смены на следующую неделю</b>\n"
+        f"Неделя {domain.week_label(monday)} пока пустая.\n\n"
+        f"Заявленную доступность нужно менять минимум за {config.NOTICE_DAYS} дней —"
+        f" позже это штраф {domain.money(domain.penalty_amount('notice'))},"
+        " так что лучше решить сейчас.\n\n"
+        + week_summary(user_id)
+    )
+
+
+# Сколько смен показываем в пинге строками и кнопками: остальные — в /confirm.
+PING_LIMIT = 6
+
+
+def unconfirmed_ping(pending: list[db.Shift]) -> str:
+    """Ежедневный пинг: неподтверждённые смены ломают расчёт, а не просто висят."""
+    n = len(pending)
+    lines = [
+        f"⏳ <b>{n} {domain.shifts_word(n)} без подтверждения</b>",
+        "",
+    ]
+    for s in pending[:PING_LIMIT]:
+        lines.append("• " + domain.shift_line(s.work_date, s.shift_num))
+    if n > PING_LIMIT:
+        lines.append(f"• …и ещё {n - PING_LIMIT}")
+    lines += [
+        "",
+        f"Пока не подтверждены, считаю их полными по {domain.fmt_hours(config.SHIFT_HOURS)} —"
+        " значит /money и /penalties показывают не то, что будет в расчётке.",
+        "Отметить часы: /confirm или кнопкой ниже.",
+    ]
+    return "\n".join(lines)
+
+
+def period_close_message(user_id: int, year: int, month: int) -> str | None:
+    """Итог закрытого периода. Нечего сказать — молчим."""
+    period = period_data(user_id, year, month)
+    if not period.counted and not period.penalties and not period.absent:
+        return None
+    lines = [
+        f"🧾 <b>Период {domain.period_title(year, month)} закрыт</b>",
+        f"<i>{domain.fmt_date_long(period.start)} — {domain.fmt_date_long(period.end)}</i>",
+        "",
+    ]
+    worked = period.done + period.unconfirmed
+    if worked:
+        n = len(worked)
+        lines.append(
+            f"✅ Отработано: {n} {domain.shifts_word(n)},"
+            f" {domain.fmt_hours(period.worked_hours)}"
+            f" — <b>{domain.money(period.earned)}</b>"
+        )
+    if period.deductions:
+        lines += deduction_lines(period)
+    lines.append(f"💵 На руки: <b>{domain.money(period.net)}</b>")
+    lines.append(
+        f"🗓 Выплата: <b>{domain.fmt_date_long(domain.payout_date(year, month))}</b>"
+    )
+    if period.unconfirmed:
+        n = len(period.unconfirmed)
+        lines += [
+            "",
+            f"⏳ {n} {domain.shifts_word(n)} без подтверждения — считаю по"
+            f" {domain.fmt_hours(config.SHIFT_HOURS)}. Успей уточнить: /confirm",
+        ]
+    return "\n".join(lines)
+
+
+def payout_message(user_id: int, year: int, month: int) -> str | None:
+    """Утро дня выплаты: сколько должно прийти и предложение сверить с фактом."""
+    period = period_data(user_id, year, month)
+    if not period.counted and not period.penalties:
+        return None
+    lines = [
+        f"💳 <b>Сегодня выплата за {domain.period_title(year, month)}</b>",
+        "",
+        f"По моему расчёту на руки: <b>{domain.money(period.net)}</b>",
+    ]
+    if period.deductions:
+        lines.append(
+            f"<i>заработано {domain.money(period.earned)},"
+            f" удержания {domain.money(period.deductions)}</i>"
+        )
+    lines += [
+        "",
+        "Когда деньги придут — отметь фактическую сумму, сверю с расчётом"
+        " и покажу расхождение.",
+    ]
+    return "\n".join(lines)
+
+
+# --- Выгрузка для сверки с расчёткой ---------------------------------------
+
+def _status_label(shift: db.Shift) -> str:
+    if shift.status == "absent":
+        return "прогул"
+    if shift.status == "cancelled":
+        return "отменена"
+    if shift.status == "done":
+        return "отработано"
+    if domain.shift_end(shift.work_date, shift.shift_num) <= domain.now():
+        return "без подтверждения"
+    return "запланировано"
+
+
+def _num(value: Decimal) -> str:
+    """Число для таблицы: запятая как разделитель — так его поймёт Excel."""
+    return f"{Decimal(value).quantize(Decimal('0.01')):f}".replace(".", ",")
+
+
+def export_name(year: int, month: int) -> str:
+    return f"smeny-{year}-{month:02d}.csv"
+
+
+def period_csv(user_id: int, year: int, month: int) -> bytes:
+    """Период таблицей: смены, штрафы и итоги — чтобы сверять с расчёткой завода.
+
+    Разделитель `;` и запятая в числах — так файл открывается двойным щелчком
+    в Excel с русской и польской локалью, без «импорта данных».
+    """
+    period = period_data(user_id, year, month)
+    buf = io.StringIO()
+    w = csv.writer(buf, delimiter=";", lineterminator="\r\n")
+
+    w.writerow(["Период", domain.period_title(year, month)])
+    w.writerow(["С", f"{period.start:%d.%m.%Y}"])
+    w.writerow(["По", f"{period.end:%d.%m.%Y}"])
+    w.writerow(["Выплата", f"{domain.payout_date(year, month):%d.%m.%Y}"])
+    w.writerow([])
+
+    w.writerow(["Дата", "День", "Смена", "Время", "Статус", "Часы", "Ставка", "Сумма"])
+    shifts = sorted(
+        period.counted + period.absent + period.cancelled,
+        key=lambda s: (s.work_date, s.shift_num),
+    )
+    for s in shifts:
+        counted = s.status not in ("absent", "cancelled")
+        w.writerow([
+            f"{s.work_date:%d.%m.%Y}",
+            domain.WEEKDAY_SHORT[s.work_date.weekday()],
+            s.kind.title,
+            s.kind.hours_label,
+            _status_label(s),
+            _num(s.hours) if counted else "0",
+            _num(s.kind.rate),
+            _num(s.pay) if counted else "0,00",
+        ])
+    w.writerow([])
+    w.writerow(["Отработано часов", _num(period.worked_hours)])
+    w.writerow(["Заработано", _num(period.earned)])
+    w.writerow([])
+
+    if period.penalties:
+        w.writerow(["Штрафы"])
+        w.writerow(["Дата", "Вид", "Сумма", "Основание", "Заметка"])
+        for pen in period.penalties:
+            kind = domain.penalty(pen.kind)
+            w.writerow([
+                f"{pen.at_date:%d.%m.%Y}", kind.title, _num(pen.amount),
+                kind.clause, pen.note or "",
+            ])
+        w.writerow(["Всего штрафов", _num(period.penalty_total)])
+        w.writerow([])
+
+    w.writerow(["Итоги"])
+    w.writerow(["Заработано", _num(period.earned)])
+    if period.penalties:
+        w.writerow(["Штрафы", "-" + _num(period.penalty_total)])
+    if period.rate_cut:
+        w.writerow([
+            f"Снижение ставки ({_num(config.RATE_CUT)}/ч)",
+            "-" + _num(period.rate_cut_amount),
+        ])
+    w.writerow(["На руки (расчёт)", _num(period.net)])
+    actual = db.get_payout(user_id, year, month)
+    if actual is not None:
+        w.writerow(["Пришло фактически", _num(actual)])
+        w.writerow(["Разница", _num(actual - period.net)])
+    w.writerow(["Валюта", config.CURRENCY])
+
+    # BOM: без него Excel читает файл как ANSI и портит русские буквы.
+    return buf.getvalue().encode("utf-8-sig")
+
+
+def export_caption(user_id: int, year: int, month: int) -> str:
+    period = period_data(user_id, year, month)
+    n = len(period.counted)
+    return (
+        f"📄 <b>{domain.period_title(year, month)}</b>"
+        f" — {n} {domain.shifts_word(n)}, {domain.fmt_hours(period.worked_hours)}\n"
+        f"На руки по расчёту: <b>{domain.money(period.net)}</b>\n"
+        f"<i>Открывается в Excel и Google Таблицах.</i>"
+    )
 
 
 # --- Достижения -----------------------------------------------------------

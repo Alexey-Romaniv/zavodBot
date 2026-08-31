@@ -85,10 +85,6 @@ def shift_end(work_date: date, num: int) -> datetime:
     return datetime.combine(end_date, s.end, tzinfo=config.TZ)
 
 
-def remind_at(work_date: date, num: int) -> datetime:
-    return shift_start(work_date, num) - config.REMIND_BEFORE
-
-
 def is_allowed_weekday(work_date: date, num: int) -> bool:
     allowed = NIGHT_WEEKDAYS if SHIFTS[num].is_night else DAY_WEEKDAYS
     return work_date.weekday() in allowed
@@ -168,6 +164,20 @@ def payout_date(year: int, month: int) -> date:
     while d.weekday() >= 5:
         d += timedelta(days=1)
     return d
+
+
+def payout_anchor(d: date) -> tuple[int, int] | None:
+    """Период, выплата за который приходится ровно на дату d (иначе None).
+
+    Выплата может съехать с 17-го на 18-е или 19-е, поэтому проверяем перебором,
+    а не арифметикой по числу месяца.
+    """
+    year, month = prev_month(d.year, d.month)
+    for _ in range(2):
+        if payout_date(year, month) == d:
+            return year, month
+        year, month = prev_month(year, month)
+    return None
 
 
 def period_title(year: int, month: int) -> str:
