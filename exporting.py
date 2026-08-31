@@ -3,8 +3,11 @@
 Отдаём .xlsx, а не CSV: в CSV пришлось бы складывать в один файл блоки с разным
 числом колонок (смены — восемь, штрафы — пять, итоги — две), и любой редактор
 выравнивает такое по первой строке, разъезжаясь на остальных. В книге Excel
-у каждого блока свой лист, даты остаются датами, суммы — числами, а итоги
-считаются формулами, так что после правки ячейки они пересчитываются сами.
+у каждого блока свой лист, даты остаются датами, а суммы — числами.
+
+Итоги пишем посчитанными значениями, а не формулами: openpyxl формулу не
+вычисляет и сохраняет без результата, поэтому Excel-то её пересчитает, а
+Numbers и предпросмотр в Telegram покажут ноль.
 
 Если openpyxl почему-то не установлен, отдаём CSV — но уже одной ровной
 таблицей, без склеенных секций.
@@ -118,10 +121,19 @@ def _shifts_sheet(ws, period: reports.Period) -> None:
         row += 1
 
     if shifts:
-        # Формулы, а не готовые числа: поправишь часы в ячейке — итог пересчитается.
+        # Готовые числа, а не =SUM(): openpyxl формулы не вычисляет и пишет их без
+        # посчитанного значения. Excel пересчитает при открытии, а Numbers,
+        # предпросмотр в Telegram и на телефоне покажут в такой ячейке ноль.
+        counted = [s for s in shifts if s.status not in ("absent", "cancelled")]
         ws.cell(row=row, column=5, value="Итого")
-        ws.cell(row=row, column=6, value=f"=SUM(F2:F{row - 1})").number_format = HOURS_FMT
-        ws.cell(row=row, column=8, value=f"=SUM(H2:H{row - 1})").number_format = MONEY_FMT
+        ws.cell(
+            row=row, column=6,
+            value=_num(sum((s.hours for s in counted), Decimal(0))),
+        ).number_format = HOURS_FMT
+        ws.cell(
+            row=row, column=8,
+            value=_num(sum((s.pay for s in counted), Decimal(0))),
+        ).number_format = MONEY_FMT
         _total_row(ws, row, 8)
     else:
         ws.cell(row=row, column=1, value="Смен за период не записано")
@@ -145,7 +157,9 @@ def _penalties_sheet(ws, period: reports.Period) -> None:
 
     if period.penalties:
         ws.cell(row=row, column=2, value="Всего штрафов")
-        ws.cell(row=row, column=3, value=f"=SUM(C2:C{row - 1})").number_format = MONEY_FMT
+        ws.cell(
+            row=row, column=3, value=_num(period.penalty_total)
+        ).number_format = MONEY_FMT
         _total_row(ws, row, 5)
     else:
         ws.cell(row=row, column=1, value="Штрафов за период нет")
@@ -153,7 +167,7 @@ def _penalties_sheet(ws, period: reports.Period) -> None:
 
 def _totals_sheet(ws, user_id: int, period: reports.Period) -> None:
     ws.title = "Итоги"
-    _head(ws, 1, ["Показатель", f"Значение, {config.CURRENCY}"])
+    _head(ws, 1, ["Показатель", "Значение"])
     _widths(ws, [34, 18])
 
     rows: list[tuple[str, object, str]] = [
@@ -162,8 +176,8 @@ def _totals_sheet(ws, user_id: int, period: reports.Period) -> None:
         ("Конец периода", period.end, "date"),
         ("Дата выплаты", domain.payout_date(period.year, period.month), "date"),
         ("", "", "text"),
-        ("Отработано часов", _num(period.worked_hours), HOURS_FMT),
-        ("Заработано", _num(period.earned), MONEY_FMT),
+        ("Отработано часов (без плана)", _num(period.worked_hours), HOURS_FMT),
+        (f"Заработано, {config.CURRENCY}", _num(period.earned), MONEY_FMT),
     ]
     if period.penalties:
         rows.append((
@@ -174,7 +188,7 @@ def _totals_sheet(ws, user_id: int, period: reports.Period) -> None:
             f"Снижение ставки ({config.RATE_CUT} {config.CURRENCY}/ч)",
             -_num(period.rate_cut_amount), MONEY_FMT,
         ))
-    rows.append(("На руки по расчёту", _num(period.net), MONEY_FMT))
+    rows.append((f"На руки по расчёту, {config.CURRENCY}", _num(period.net), MONEY_FMT))
 
     actual = db.get_payout(user_id, period.year, period.month)
     if actual is not None:
@@ -194,7 +208,7 @@ def _totals_sheet(ws, user_id: int, period: reports.Period) -> None:
             cell.number_format = DATE_FMT
         elif fmt not in ("text",):
             cell.number_format = fmt
-        if label in ("На руки по расчёту", "Разница"):
+        if label.startswith(("На руки по расчёту", "Разница")):
             _total_row(ws, row, 2)
         row += 1
 

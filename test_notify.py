@@ -386,19 +386,39 @@ def test_export_xlsx():
     assert smeny["F2"].value == 8 and isinstance(smeny["F2"].value, (int, float))
     assert smeny["H2"].value == 265.20
     assert smeny["G3"].value == 35.20                # ночная ставка
-    # итог строкой-формулой: поправишь часы — пересчитается
-    assert str(smeny["F4"].value).startswith("=SUM(")
+    # Итог — посчитанное число: формулу openpyxl сохранил бы без значения,
+    # и в предпросмотре на телефоне вместо суммы был бы ноль.
+    assert smeny["E4"].value == "Итого"
+    assert smeny["F4"].value == 16          # 8 + 8, прогул и отмена не в счёт
+    assert smeny["H4"].value == float(Decimal("546.80"))
+    for ws in book:
+        for row in ws.iter_rows():
+            for cell in row:
+                assert not (isinstance(cell.value, str) and cell.value.startswith("=")), (
+                    f"{ws.title}!{cell.coordinate}: формула вместо значения"
+                )
     assert smeny.freeze_panes == "A2"
 
     fines = book["Штрафы"]
     assert fines["B2"].value == "Опоздание" and fines["C2"].value == 150.0
 
-    totals = {r[0].value: r[1].value for r in book["Итоги"].iter_rows(min_row=2)}
-    assert totals["Заработано"] == 546.80           # 265,20 + 281,60
-    assert totals["Штрафы (1)"] == -150.0
-    assert totals["На руки по расчёту"] == 396.80
-    assert totals["Пришло фактически"] == 1000.0
-    assert round(totals["Разница"], 2) == 603.20
+    # Часть подписей несёт валюту, поэтому ищем по началу строки
+    totals = {}
+    for label, value in ((r[0].value, r[1].value) for r in book["Итоги"].iter_rows(min_row=2)):
+        if label:
+            totals[label] = value
+
+    def total(prefix: str):
+        matches = [v for k, v in totals.items() if k.startswith(prefix)]
+        assert len(matches) == 1, f"{prefix}: нашлось {len(matches)} строк"
+        return matches[0]
+
+    assert total("Заработано") == 546.80            # 265,20 + 281,60
+    assert total("Штрафы (1)") == -150.0
+    assert total("На руки по расчёту") == 396.80
+    assert total("Пришло фактически") == 1000.0
+    assert round(total("Разница"), 2) == 603.20
+    assert total("Отработано часов") == 16
     assert domain.period_title(2026, 8) in exporting.caption(uid, 2026, 8)
 
 
