@@ -4,6 +4,8 @@
 """
 from __future__ import annotations
 
+import csv
+import io
 import os
 import tempfile
 from datetime import date, datetime, time, timedelta
@@ -14,6 +16,7 @@ os.environ.setdefault("SHIFTBOT_DB", os.path.join(tempfile.mkdtemp(), "test.db")
 import config  # noqa: E402
 import db  # noqa: E402
 import domain  # noqa: E402
+import exporting  # noqa: E402
 import notify  # noqa: E402
 import parsing  # noqa: E402
 import reports  # noqa: E402
@@ -355,7 +358,8 @@ def test_settings_report():
     assert "пинг про неподтверждённые" not in text
 
 
-def test_period_csv():
+def test_export_xlsx():
+    """Выгрузка — книга Excel: у каждого блока свой лист, числа остаются числами."""
     db.init()
     uid = 9012
     db.ensure_user(uid)
@@ -364,17 +368,67 @@ def test_period_csv():
     db.add_penalty(uid, date(2026, 8, 5), "late")
     db.set_payout(uid, 2026, 8, Decimal("1000"))
 
-    raw = reports.period_csv(uid, 2026, 8)
+    assert exporting.HAVE_XLSX, "openpyxl должен стоять — он в requirements.txt"
+    assert exporting.export_name(2026, 8) == "smeny-2026-08.xlsx"
+    raw = exporting.period_file(uid, 2026, 8)
+    assert raw.startswith(b"PK")                    # xlsx это zip
+
+    from openpyxl import load_workbook
+    book = load_workbook(io.BytesIO(raw))
+    assert book.sheetnames == ["Смены", "Штрафы", "Итоги"]
+
+    smeny = book["Смены"]
+    assert [c.value for c in smeny[1]][:6] == [
+        "Дата", "День", "Смена", "Время", "Статус", "Часы",
+    ]
+    # даты — датами, часы и суммы — числами, иначе сверять невозможно
+    assert smeny["A2"].value.date() == date(2026, 8, 3)
+    assert smeny["F2"].value == 8 and isinstance(smeny["F2"].value, (int, float))
+    assert smeny["H2"].value == 265.20
+    assert smeny["G3"].value == 35.20                # ночная ставка
+    # итог строкой-формулой: поправишь часы — пересчитается
+    assert str(smeny["F4"].value).startswith("=SUM(")
+    assert smeny.freeze_panes == "A2"
+
+    fines = book["Штрафы"]
+    assert fines["B2"].value == "Опоздание" and fines["C2"].value == 150.0
+
+    totals = {r[0].value: r[1].value for r in book["Итоги"].iter_rows(min_row=2)}
+    assert totals["Заработано"] == 546.80           # 265,20 + 281,60
+    assert totals["Штрафы (1)"] == -150.0
+    assert totals["На руки по расчёту"] == 396.80
+    assert totals["Пришло фактически"] == 1000.0
+    assert round(totals["Разница"], 2) == 603.20
+    assert domain.period_title(2026, 8) in exporting.caption(uid, 2026, 8)
+
+
+def test_export_csv_fallback_is_one_flat_table():
+    """Без openpyxl отдаём CSV — но одной ровной таблицей, без склеенных секций."""
+    db.init()
+    uid = 9013
+    db.ensure_user(uid)
+    db.add_shift(uid, date(2026, 8, 3), 1)
+    db.add_penalty(uid, date(2026, 8, 5), "late")
+
+    raw = exporting.period_csv(uid, 2026, 8)
     assert raw.startswith(b"\xef\xbb\xbf")          # BOM, иначе Excel испортит кириллицу
-    text = raw.decode("utf-8-sig")
-    assert "Период;Август 2026" in text
-    assert "Дата;День;Смена;Время;Статус;Часы;Ставка;Сумма" in text
-    assert "03.08.2026;Пн;1я смена" in text
-    assert "Опоздание" in text
-    assert "Пришло фактически;1000,00" in text
-    assert "33,15" in text                          # запятая как десятичный разделитель
-    assert reports.export_name(2026, 8) == "smeny-2026-08.csv"
-    assert domain.period_title(2026, 8) in reports.export_caption(uid, 2026, 8)
+    rows = list(csv.reader(io.StringIO(raw.decode("utf-8-sig")), delimiter=";"))
+    # ровно 8 колонок в каждой строке — иначе редакторы разъезжаются
+    assert {len(r) for r in rows if r} == {8}, {len(r) for r in rows if r}
+    assert rows[0][0] == "Дата" and rows[0][5] == "Часы"
+    assert rows[1][0] == "03.08.2026"
+
+
+def test_period_text_fits_a_message():
+    db.init()
+    uid = 9014
+    db.ensure_user(uid)
+    for day in range(3, 12):
+        db.add_shift(uid, date(2026, 8, day), 1 if day % 2 else 2)
+    text = exporting.period_text(uid, 2026, 8)
+    assert len(text) < 4096                          # лимит одного сообщения Telegram
+    assert domain.period_title(2026, 8) in text
+    assert "На руки" in text
 
 
 def test_parse_amount():

@@ -1,8 +1,6 @@
 """Сборка отчётов: неделя, предстоящие смены, деньги за период, выгрузка в CSV."""
 from __future__ import annotations
 
-import csv
-import io
 from dataclasses import dataclass
 from datetime import date, timedelta
 from decimal import Decimal
@@ -520,110 +518,6 @@ def payout_message(user_id: int, year: int, month: int) -> str | None:
         " и покажу расхождение.",
     ]
     return "\n".join(lines)
-
-
-# --- Выгрузка для сверки с расчёткой ---------------------------------------
-
-def _status_label(shift: db.Shift) -> str:
-    if shift.status == "absent":
-        return "прогул"
-    if shift.status == "cancelled":
-        return "отменена"
-    if shift.status == "done":
-        return "отработано"
-    if domain.shift_end(shift.work_date, shift.shift_num) <= domain.now():
-        return "без подтверждения"
-    return "запланировано"
-
-
-def _num(value: Decimal) -> str:
-    """Число для таблицы: запятая как разделитель — так его поймёт Excel."""
-    return f"{Decimal(value).quantize(Decimal('0.01')):f}".replace(".", ",")
-
-
-def export_name(year: int, month: int) -> str:
-    return f"smeny-{year}-{month:02d}.csv"
-
-
-def period_csv(user_id: int, year: int, month: int) -> bytes:
-    """Период таблицей: смены, штрафы и итоги — чтобы сверять с расчёткой завода.
-
-    Разделитель `;` и запятая в числах — так файл открывается двойным щелчком
-    в Excel с русской и польской локалью, без «импорта данных».
-    """
-    period = period_data(user_id, year, month)
-    buf = io.StringIO()
-    w = csv.writer(buf, delimiter=";", lineterminator="\r\n")
-
-    w.writerow(["Период", domain.period_title(year, month)])
-    w.writerow(["С", f"{period.start:%d.%m.%Y}"])
-    w.writerow(["По", f"{period.end:%d.%m.%Y}"])
-    w.writerow(["Выплата", f"{domain.payout_date(year, month):%d.%m.%Y}"])
-    w.writerow([])
-
-    w.writerow(["Дата", "День", "Смена", "Время", "Статус", "Часы", "Ставка", "Сумма"])
-    shifts = sorted(
-        period.counted + period.absent + period.cancelled,
-        key=lambda s: (s.work_date, s.shift_num),
-    )
-    for s in shifts:
-        counted = s.status not in ("absent", "cancelled")
-        w.writerow([
-            f"{s.work_date:%d.%m.%Y}",
-            domain.WEEKDAY_SHORT[s.work_date.weekday()],
-            s.kind.title,
-            s.kind.hours_label,
-            _status_label(s),
-            _num(s.hours) if counted else "0",
-            _num(s.kind.rate),
-            _num(s.pay) if counted else "0,00",
-        ])
-    w.writerow([])
-    w.writerow(["Отработано часов", _num(period.worked_hours)])
-    w.writerow(["Заработано", _num(period.earned)])
-    w.writerow([])
-
-    if period.penalties:
-        w.writerow(["Штрафы"])
-        w.writerow(["Дата", "Вид", "Сумма", "Основание", "Заметка"])
-        for pen in period.penalties:
-            kind = domain.penalty(pen.kind)
-            w.writerow([
-                f"{pen.at_date:%d.%m.%Y}", kind.title, _num(pen.amount),
-                kind.clause, pen.note or "",
-            ])
-        w.writerow(["Всего штрафов", _num(period.penalty_total)])
-        w.writerow([])
-
-    w.writerow(["Итоги"])
-    w.writerow(["Заработано", _num(period.earned)])
-    if period.penalties:
-        w.writerow(["Штрафы", "-" + _num(period.penalty_total)])
-    if period.rate_cut:
-        w.writerow([
-            f"Снижение ставки ({_num(config.RATE_CUT)}/ч)",
-            "-" + _num(period.rate_cut_amount),
-        ])
-    w.writerow(["На руки (расчёт)", _num(period.net)])
-    actual = db.get_payout(user_id, year, month)
-    if actual is not None:
-        w.writerow(["Пришло фактически", _num(actual)])
-        w.writerow(["Разница", _num(actual - period.net)])
-    w.writerow(["Валюта", config.CURRENCY])
-
-    # BOM: без него Excel читает файл как ANSI и портит русские буквы.
-    return buf.getvalue().encode("utf-8-sig")
-
-
-def export_caption(user_id: int, year: int, month: int) -> str:
-    period = period_data(user_id, year, month)
-    n = len(period.counted)
-    return (
-        f"📄 <b>{domain.period_title(year, month)}</b>"
-        f" — {n} {domain.shifts_word(n)}, {domain.fmt_hours(period.worked_hours)}\n"
-        f"На руки по расчёту: <b>{domain.money(period.net)}</b>\n"
-        f"<i>Открывается в Excel и Google Таблицах.</i>"
-    )
 
 
 # --- Достижения -----------------------------------------------------------

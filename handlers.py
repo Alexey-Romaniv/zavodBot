@@ -1,6 +1,7 @@
 """Хендлеры Telegram: команды, выбор смен на неделю, отмена, деньги, ручной ввод."""
 from __future__ import annotations
 
+import calendar
 from datetime import date, time, timedelta
 from decimal import Decimal
 
@@ -15,6 +16,7 @@ import achievements
 import config
 import db
 import domain
+import exporting
 import keyboards as kb
 import notify
 import parsing
@@ -26,8 +28,7 @@ router = Router()
 
 class Flow(StatesGroup):
     picking_days = State()
-    manual_entry = State()
-    custom_hours = State()
+    manual_days = State()
     penalty_entry = State()
     payout_amount = State()
 
@@ -76,7 +77,7 @@ async def award(target: Message | CallbackQuery, user_id: int) -> None:
 
 
 @router.message(Command("achievements"))
-@router.message(F.text == kb.BTN_ACH)
+@router.message(F.text.in_(kb.TXT_ACH))
 async def cmd_achievements(message: Message, state: FSMContext) -> None:
     await state.clear()
     db.ensure_user(message.from_user.id)
@@ -115,6 +116,7 @@ async def cmd_ask_off(message: Message) -> None:
 # --- Настройки и тишина ---------------------------------------------------
 
 @router.message(Command("settings"))
+@router.message(F.text.in_(kb.TXT_SETTINGS))
 async def cmd_settings(message: Message, state: FSMContext) -> None:
     await state.clear()
     db.ensure_user(message.from_user.id)
@@ -277,7 +279,7 @@ async def cb_settings_close(call: CallbackQuery) -> None:
 # --- Смены на неделю ------------------------------------------------------
 
 @router.message(Command("week"))
-@router.message(F.text == kb.BTN_WEEK)
+@router.message(F.text.in_(kb.TXT_WEEK))
 async def cmd_week(message: Message, state: FSMContext) -> None:
     await state.clear()
     db.ensure_user(message.from_user.id)
@@ -427,7 +429,7 @@ async def cb_close(call: CallbackQuery, state: FSMContext) -> None:
 # --- Предстоящие смены и отмена -------------------------------------------
 
 @router.message(Command("shifts"))
-@router.message(F.text == kb.BTN_MY)
+@router.message(F.text.in_(kb.TXT_MY))
 async def cmd_shifts(message: Message, state: FSMContext) -> None:
     await state.clear()
     db.ensure_user(message.from_user.id)
@@ -479,7 +481,7 @@ async def cb_restore_shift(call: CallbackQuery, callback_data: kb.ShiftCb) -> No
 # --- Деньги ---------------------------------------------------------------
 
 @router.message(Command("money"))
-@router.message(F.text == kb.BTN_MONEY)
+@router.message(F.text.in_(kb.TXT_MONEY))
 async def cmd_money(message: Message, state: FSMContext) -> None:
     await state.clear()
     db.ensure_user(message.from_user.id)
@@ -568,10 +570,13 @@ async def cb_payout_delete(call: CallbackQuery, callback_data: kb.MoneyCb) -> No
 
 async def _send_export(message: Message, user_id: int, year: int, month: int) -> None:
     document = BufferedInputFile(
-        reports.period_csv(user_id, year, month), filename=reports.export_name(year, month)
+        exporting.period_file(user_id, year, month),
+        filename=exporting.export_name(year, month),
     )
     await message.answer_document(
-        document, caption=reports.export_caption(user_id, year, month)
+        document,
+        caption=exporting.caption(user_id, year, month),
+        reply_markup=kb.export_done(year, month),
     )
 
 
@@ -583,11 +588,34 @@ async def cmd_export(message: Message, state: FSMContext) -> None:
     await _send_export(message, message.from_user.id, year, month)
 
 
+@router.message(F.text.in_(kb.TXT_REPORT))
+async def btn_report(message: Message, state: FSMContext) -> None:
+    """Отчёт за период: сначала списком в чат, файл — кнопкой под ним."""
+    await state.clear()
+    db.ensure_user(message.from_user.id)
+    year, month = domain.period_anchor(domain.today())
+    await message.answer(
+        exporting.period_text(message.from_user.id, year, month),
+        reply_markup=kb.money_nav(message.from_user.id, year, month),
+    )
+
+
 @router.callback_query(kb.MoneyCb.filter(F.action == "export"))
 async def cb_money_export(call: CallbackQuery, callback_data: kb.MoneyCb) -> None:
     year, month = _ym(callback_data.ym)
     await _send_export(call.message, call.from_user.id, year, month)
     await call.answer("Готово")
+
+
+@router.callback_query(kb.MoneyCb.filter(F.action == "list"))
+async def cb_money_list(call: CallbackQuery, callback_data: kb.MoneyCb) -> None:
+    """Тот же период, но сообщением: на телефоне это удобнее, чем открывать файл."""
+    year, month = _ym(callback_data.ym)
+    await call.message.answer(
+        exporting.period_text(call.from_user.id, year, month),
+        reply_markup=kb.money_nav(call.from_user.id, year, month),
+    )
+    await call.answer()
 
 
 # --- Штрафы ---------------------------------------------------------------
@@ -604,7 +632,7 @@ async def _show_penalties(target: Message | CallbackQuery, year: int, month: int
 
 
 @router.message(Command("penalties"))
-@router.message(F.text == kb.BTN_PENALTY)
+@router.message(F.text.in_(kb.TXT_PENALTY))
 async def cmd_penalties(message: Message, state: FSMContext) -> None:
     await state.clear()
     db.ensure_user(message.from_user.id)
@@ -644,16 +672,50 @@ async def cb_penalty_delete(call: CallbackQuery, callback_data: kb.PenaltyCb) ->
 
 @router.callback_query(kb.PenaltyCb.filter(F.action == "menu"))
 async def cb_penalty_menu(call: CallbackQuery, callback_data: kb.PenaltyCb, state: FSMContext) -> None:
-    year, month = (int(x) for x in callback_data.ym.split("-"))
+    await state.clear()
+    await call.message.edit_text(
+        "<b>Записать штраф</b>\n"
+        f"Что случилось {domain.fmt_date(domain.today())}?\n\n"
+        "<i>Суммы — договорные. Для другого дня есть кнопка ниже.</i>",
+        reply_markup=kb.penalty_kinds(callback_data.ym),
+    )
+    await call.answer()
+
+
+@router.callback_query(kb.PenaltyCb.filter(F.action == "day"))
+async def cb_penalty_day(call: CallbackQuery, callback_data: kb.PenaltyCb, state: FSMContext) -> None:
+    await state.clear()
+    year, month = _ym(callback_data.ym)
+    start, end = domain.period_bounds(year, month)
+    await call.message.edit_text(
+        "<b>Записать штраф</b>\nКакой день?\n"
+        f"<i>период {domain.fmt_date(start)} — {domain.fmt_date(end)}</i>",
+        reply_markup=kb.penalty_days(year, month),
+    )
+    await call.answer()
+
+
+@router.callback_query(kb.PenaltyCb.filter(F.action == "day_set"))
+async def cb_penalty_day_set(call: CallbackQuery, callback_data: kb.PenaltyCb) -> None:
+    at_date = date.fromisoformat(callback_data.arg)
+    await call.message.edit_text(
+        f"<b>Записать штраф</b>\nЧто случилось {domain.fmt_date_long(at_date)}?",
+        reply_markup=kb.penalty_kinds(callback_data.ym, at_date),
+    )
+    await call.answer()
+
+
+@router.callback_query(kb.PenaltyCb.filter(F.action == "manual"))
+async def cb_penalty_manual(call: CallbackQuery, callback_data: kb.PenaltyCb, state: FSMContext) -> None:
+    """Своя сумма или заметка — единственное, что кнопками не задать."""
+    year, month = _ym(callback_data.ym)
     await state.set_state(Flow.penalty_entry)
     await state.update_data(year=year, month=month)
     await call.message.edit_text(
-        "<b>Записать штраф</b>\n"
-        f"Кнопкой — на сегодня ({domain.fmt_date(domain.today())}).\n\n"
-        "Другой день или своя сумма — напиши строкой:\n"
-        "<code>15.08 опоздание</code>\n"
-        "<code>15 прогул 200</code>\n"
-        "<code>2.09 доступность не сообщил вовремя</code>\n\n"
+        "<b>Своя сумма или заметка</b>\n"
+        "Напиши строкой, например:\n"
+        "<code>15 прогул 200</code> — 15-го числа, прогул на 200\n"
+        "<code>15.08 опоздание склад</code> — с заметкой\n\n"
         "Отмена — /cancel",
         reply_markup=kb.penalty_kinds(callback_data.ym),
     )
@@ -663,12 +725,11 @@ async def cb_penalty_menu(call: CallbackQuery, callback_data: kb.PenaltyCb, stat
 @router.callback_query(kb.PenaltyCb.filter(F.action == "kind"))
 async def cb_penalty_kind(call: CallbackQuery, callback_data: kb.PenaltyCb, state: FSMContext) -> None:
     await state.clear()
-    year, month = (int(x) for x in callback_data.ym.split("-"))
-    code = callback_data.arg
+    code, _, raw_date = callback_data.arg.partition("|")
     if code not in domain.PENALTIES:
         await call.answer("Неизвестный вид", show_alert=True)
         return
-    at_date = domain.today()
+    at_date = date.fromisoformat(raw_date) if raw_date else domain.today()
     db.add_penalty(call.from_user.id, at_date, code)
     kind = domain.penalty(code)
     await call.answer(f"{kind.title}: {domain.money(kind.amount)}")
@@ -702,70 +763,155 @@ async def on_penalty_entry(message: Message, state: FSMContext) -> None:
     await _show_penalties(message, year, month, edit=False)
 
 
-# --- Ручной ввод смен -----------------------------------------------------
+# --- Вписать смены за прошлые дни -----------------------------------------
 
 @router.message(Command("add"))
-@router.message(F.text == kb.BTN_MANUAL)
+@router.message(F.text.in_(kb.TXT_MANUAL))
 async def cmd_add(message: Message, state: FSMContext) -> None:
+    """Смены задним числом — кнопками: месяц, смена, дни. Ничего писать не нужно."""
+    await state.clear()
     db.ensure_user(message.from_user.id)
     year, month = domain.period_anchor(domain.today())
-    await state.set_state(Flow.manual_entry)
-    await state.update_data(year=year, month=month)
-    await message.answer(
-        "Впиши смены — одну на строку или через запятую.\n\n"
-        "<b>Формат:</b> <code>дата номер смены</code>\n"
-        "<code>5.08 1</code> — 5 августа, 1я смена\n"
-        "<code>12 3</code> — 12-е число текущего периода, ночная\n"
-        "<code>10-14.08 2</code> — с 10 по 14 августа, 2я смена\n\n"
-        f"Месяц по умолчанию: <b>{domain.MONTHS_NOM[month - 1]} {year}</b>.\n"
-        "Отмена — /cancel"
+    await message.answer(_manual_intro(year, month), reply_markup=kb.manual_shift_choice(year, month))
+
+
+def _manual_intro(year: int, month: int) -> str:
+    start, end = domain.period_bounds(*domain.period_anchor(date(year, month, 15)))
+    return (
+        f"✍️ <b>Вписать смены — {domain.MONTHS_NOM[month - 1]} {year}</b>\n"
+        f"<i>расчётный период {domain.fmt_date(start)} — {domain.fmt_date(end)}</i>\n\n"
+        "Выбери смену, потом отметь дни. Месяц листается стрелками."
     )
 
 
 @router.message(Command("cancel"))
 async def cmd_cancel(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await message.answer("Отменил ввод.", reply_markup=kb.main_menu())
+    await message.answer("Отменил.", reply_markup=kb.main_menu())
 
 
-@router.message(Flow.manual_entry, F.text)
-async def on_manual_entry(message: Message, state: FSMContext) -> None:
-    data = await state.get_data()
-    entries, errors = parsing.parse_entries(message.text, data["year"], data["month"])
-    if not entries and errors:
-        await message.answer(
-            "Не понял ни одной строки. Пример: <code>5.08 1</code> или <code>10-14.08 2</code>.\n"
-            "Отмена — /cancel"
-        )
-        return
-
+@router.callback_query(kb.ManualCb.filter(F.action == "month"))
+async def cb_manual_month(call: CallbackQuery, callback_data: kb.ManualCb, state: FSMContext) -> None:
     await state.clear()
-    added, exists = [], 0
-    for work_date, num in entries:
-        result = db.add_shift(message.from_user.id, work_date, num)
-        if result == "exists":
-            exists += 1
-        else:
-            added.append((work_date, num))
-
-    total = sum((domain.shift(n).pay for _, n in added), Decimal(0))
-    lines = [f"Записал: <b>{len(added)}</b> {domain.shifts_word(len(added))}"]
-    for work_date, num in added:
-        lines.append("• " + domain.shift_line(work_date, num))
-    if added:
-        lines.append(f"\nЗа них: <b>{domain.money(total)}</b>")
-    if exists:
-        lines.append(f"Уже были записаны: {exists}")
-    if errors:
-        lines.append("\n⚠️ Не понял: " + ", ".join(f"<code>{e}</code>" for e in errors))
-    await message.answer("\n".join(lines), reply_markup=kb.main_menu())
-
-    year, month = data["year"], data["month"]
-    await message.answer(
-        reports.money_report(message.from_user.id, year, month),
-        reply_markup=kb.money_nav(message.from_user.id, year, month),
+    year, month = _ym(callback_data.ym)
+    await call.message.edit_text(
+        _manual_intro(year, month), reply_markup=kb.manual_shift_choice(year, month)
     )
-    await award(message, message.from_user.id)
+    await call.answer()
+
+
+@router.callback_query(kb.ManualCb.filter(F.action == "shift"))
+async def cb_manual_shift(call: CallbackQuery, callback_data: kb.ManualCb, state: FSMContext) -> None:
+    year, month = _ym(callback_data.ym)
+    num = int(callback_data.arg)
+    first = date(year, month, 1)
+    last = date(year, month, calendar.monthrange(year, month)[1])
+    already = {
+        s.work_date
+        for s in db.shifts_in_range(call.from_user.id, first, last)
+        if s.shift_num == num
+    }
+    await state.set_state(Flow.manual_days)
+    await state.update_data(
+        year=year, month=month, num=num, selected=[d.isoformat() for d in already]
+    )
+    await call.message.edit_text(
+        _manual_days_text(year, month, num, already),
+        reply_markup=kb.manual_days(year, month, num, already),
+    )
+    await call.answer()
+
+
+def _manual_days_text(year: int, month: int, num: int, selected: set[date]) -> str:
+    shift = domain.shift(num)
+    total = shift.pay * len(selected)
+    return (
+        f"<b>{shift.title}</b> {shift.hours_label} · {domain.money(shift.pay)} за смену\n"
+        f"{domain.MONTHS_NOM[month - 1]} {year}\n\n"
+        f"Отмечено: <b>{len(selected)}</b> {domain.shifts_word(len(selected))}"
+        f" · {domain.money(total)}\n"
+        "<i>Нажми на дни, когда работал, и сохрани.</i>"
+    )
+
+
+@router.callback_query(Flow.manual_days, kb.ManualCb.filter(F.action == "day"))
+async def cb_manual_day(call: CallbackQuery, callback_data: kb.ManualCb, state: FSMContext) -> None:
+    data = await state.get_data()
+    year, month, num = data["year"], data["month"], data["num"]
+    picked = date(year, month, int(callback_data.arg)).isoformat()
+    selected = set(data["selected"])
+    selected.symmetric_difference_update({picked})
+    await state.update_data(selected=sorted(selected))
+    days = {date.fromisoformat(x) for x in selected}
+    await call.message.edit_text(
+        _manual_days_text(year, month, num, days),
+        reply_markup=kb.manual_days(year, month, num, days),
+    )
+    await call.answer()
+
+
+@router.callback_query(Flow.manual_days, kb.ManualCb.filter(F.action == "save"))
+async def cb_manual_save(call: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    await state.clear()
+    year, month, num = data["year"], data["month"], data["num"]
+    selected = {date.fromisoformat(x) for x in data["selected"]}
+
+    added, removed, kept = [], [], []
+    last = calendar.monthrange(year, month)[1]
+    for day in range(1, last + 1):
+        d = date(year, month, day)
+        existing = [s for s in db.shifts_in_range(call.from_user.id, d, d) if s.shift_num == num]
+        if d in selected and not existing:
+            db.add_shift(call.from_user.id, d, num)
+            added.append(d)
+        elif d not in selected and existing:
+            # подтверждённую смену не трогаем — это уже история, а не план
+            if existing[0].confirmed:
+                kept.append(d)
+            else:
+                db.delete_shift(call.from_user.id, d, num)
+                removed.append(d)
+
+    shift = domain.shift(num)
+    lines = [f"<b>{shift.title}</b> {shift.hours_label} — сохранено."]
+    if added:
+        lines.append("Добавлено: " + ", ".join(domain.fmt_date(d) for d in added))
+        lines.append(f"За них: <b>{domain.money(shift.pay * len(added))}</b>")
+    if removed:
+        lines.append("Убрано: " + ", ".join(domain.fmt_date(d) for d in removed))
+    if kept:
+        lines.append(
+            "Оставил как есть (уже подтверждены): "
+            + ", ".join(domain.fmt_date(d) for d in kept)
+        )
+    if not added and not removed:
+        lines.append("Изменений нет.")
+    await call.message.edit_text("\n".join(lines), reply_markup=kb.manual_shift_choice(year, month))
+    await call.answer("Сохранено")
+
+    anchor_year, anchor_month = domain.period_anchor(date(year, month, 15))
+    await call.message.answer(
+        reports.money_report(call.from_user.id, anchor_year, anchor_month),
+        reply_markup=kb.money_nav(call.from_user.id, anchor_year, anchor_month),
+    )
+    await award(call, call.from_user.id)
+
+
+@router.callback_query(kb.ManualCb.filter(F.action == "close"))
+async def cb_manual_close(call: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await call.message.edit_text("Ок. Вписать смены — кнопка «✍️ Вписать смены».")
+    await call.answer()
+
+
+@router.callback_query(kb.ManualCb.filter(F.action.in_({"day", "save"})))
+async def cb_manual_stale(call: CallbackQuery) -> None:
+    """Кнопки из старого сообщения: выбор потерялся при перезапуске бота."""
+    await call.message.edit_text(
+        "Это сообщение устарело — выбор сбросился. Начни заново: «✍️ Вписать смены»."
+    )
+    await call.answer("Сообщение устарело", show_alert=True)
 
 
 # --- Подтверждение прошедших смен ------------------------------------------
@@ -918,36 +1064,57 @@ async def cb_confirm_save(call: CallbackQuery, callback_data: kb.ConfirmCb) -> N
     await award(call, call.from_user.id)
 
 
-@router.callback_query(kb.ConfirmCb.filter(F.action == "custom"))
-async def cb_confirm_custom(call: CallbackQuery, callback_data: kb.ConfirmCb, state: FSMContext) -> None:
+@router.callback_query(kb.ConfirmCb.filter(F.action == "halves"))
+async def cb_confirm_halves(call: CallbackQuery, callback_data: kb.ConfirmCb) -> None:
+    """Часы с половинками — те же кнопки, только с шагом полчаса."""
     shift = db.get_shift(callback_data.shift_id, call.from_user.id)
     if shift is None:
         await call.answer("Смена не найдена", show_alert=True)
         return
-    await state.set_state(Flow.custom_hours)
-    await state.update_data(shift_id=shift.id)
     await call.message.edit_text(
-        f"{domain.shift_line(shift.work_date, shift.shift_num)}\n\n"
-        "Напиши, сколько часов зачли — например <code>6,5</code>. Отмена — /cancel"
+        f"{domain.shift_line(shift.work_date, shift.shift_num)}\n\nСколько часов зачли?",
+        reply_markup=kb.confirm_halves(shift.id),
     )
     await call.answer()
 
 
-@router.message(Flow.custom_hours, F.text)
-async def on_custom_hours(message: Message, state: FSMContext) -> None:
-    raw = message.text.strip().replace(",", ".").replace("ч", "").strip()
-    try:
-        hours = Decimal(raw)
-    except Exception:
-        await message.answer("Не понял число. Например: <code>6,5</code>. Отмена — /cancel")
+# --- Текст, набранный по привычке -----------------------------------------
+
+@router.message(F.text, ~F.text.startswith("/"))
+async def on_loose_text(message: Message, state: FSMContext) -> None:
+    """Всё в боте делается кнопками, но набранное руками «5.08 1» тоже поймём.
+
+    Стоит последним: сюда попадает только то, что не разобрали ни кнопки меню,
+    ни активный шаг ввода.
+    """
+    db.ensure_user(message.from_user.id)
+    year, month = domain.period_anchor(domain.today())
+    entries, _ = parsing.parse_entries(message.text, year, month)
+    if not entries:
+        await message.answer(
+            "Я работаю кнопками — они внизу экрана 👇\n"
+            "<i>Смены можно и текстом: например</i> <code>5.08 1</code>",
+            reply_markup=kb.main_menu(),
+        )
         return
-    if not (Decimal(0) <= hours <= Decimal(24)):
-        await message.answer("Часы должны быть от 0 до 24. Отмена — /cancel")
-        return
-    data = await state.get_data()
-    await state.clear()
-    text = await _save_confirmation(
-        message, message.from_user.id, data["shift_id"], None if hours == 0 else hours
+
+    added, exists = [], 0
+    for work_date, num in entries:
+        if db.add_shift(message.from_user.id, work_date, num) == "exists":
+            exists += 1
+        else:
+            added.append((work_date, num))
+
+    total = sum((domain.shift(n).pay for _, n in added), Decimal(0))
+    lines = [f"Записал: <b>{len(added)}</b> {domain.shifts_word(len(added))}"]
+    lines += ["• " + domain.shift_line(d, n) for d, n in added]
+    if added:
+        lines.append(f"\nЗа них: <b>{domain.money(total)}</b>")
+    if exists:
+        lines.append(f"Уже были записаны: {exists}")
+    await message.answer("\n".join(lines), reply_markup=kb.main_menu())
+    await message.answer(
+        reports.money_report(message.from_user.id, year, month),
+        reply_markup=kb.money_nav(message.from_user.id, year, month),
     )
-    await message.answer(text or "Смена не найдена.", reply_markup=kb.main_menu())
     await award(message, message.from_user.id)

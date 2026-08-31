@@ -22,18 +22,20 @@ import handlers_admin
 import middlewares
 import scheduler
 
+# Список для меню Telegram: те же действия доступны кнопками, но кому-то
+# привычнее выбрать из «/» — пусть будет и там.
 COMMANDS = [
-    BotCommand(command="week", description="Смены на неделю"),
-    BotCommand(command="shifts", description="Предстоящие смены / отмена"),
-    BotCommand(command="add", description="Вписать смены вручную"),
-    BotCommand(command="confirm", description="Подтвердить прошедшие смены"),
-    BotCommand(command="money", description="Деньги и дата выплаты"),
-    BotCommand(command="penalties", description="Штрафы и удержания"),
-    BotCommand(command="achievements", description="Достижения и звание"),
-    BotCommand(command="export", description="Выгрузить период файлом"),
-    BotCommand(command="settings", description="Уведомления и тихие часы"),
-    BotCommand(command="mute", description="Помолчать до конца дня"),
-    BotCommand(command="help", description="Справка"),
+    BotCommand(command="week", description="📅 Смены на неделю"),
+    BotCommand(command="shifts", description="🗓 Предстоящие смены / отмена"),
+    BotCommand(command="money", description="💰 Деньги и дата выплаты"),
+    BotCommand(command="penalties", description="⚖️ Штрафы и удержания"),
+    BotCommand(command="confirm", description="⏳ Подтвердить прошедшие смены"),
+    BotCommand(command="add", description="✍️ Вписать смены задним числом"),
+    BotCommand(command="export", description="📄 Выгрузить период в таблицу"),
+    BotCommand(command="achievements", description="🏅 Достижения и звание"),
+    BotCommand(command="settings", description="⚙️ Уведомления и тихие часы"),
+    BotCommand(command="mute", description="🔇 Помолчать до конца дня"),
+    BotCommand(command="help", description="❓ Справка"),
 ]
 
 

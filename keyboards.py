@@ -1,7 +1,9 @@
 """Клавиатуры и callback-данные."""
 from __future__ import annotations
 
+import calendar
 from datetime import date, timedelta
+from decimal import Decimal
 
 from aiogram.filters.callback_data import CallbackData
 from aiogram.types import (
@@ -17,12 +19,27 @@ import db
 import domain
 import texts
 
+# Подписи кнопок главного меню. Короткие — иначе на телефоне переносятся
+# в две строки и клавиатура выглядит рваной.
 BTN_WEEK = "📅 Смены на неделю"
 BTN_MY = "🗓 Мои смены"
 BTN_MONEY = "💰 Деньги"
-BTN_MANUAL = "✍️ Вписать вручную"
+BTN_MANUAL = "✍️ Вписать смены"
 BTN_ACH = "🏅 Достижения"
 BTN_PENALTY = "⚖️ Штрафы"
+BTN_REPORT = "📄 Отчёт"
+BTN_SETTINGS = "⚙️ Настройки"
+
+# Клавиатура живёт в клиенте, пока не пришлём новую, поэтому старые подписи
+# продолжают приходить от тех, кто давно не писал боту. Принимаем и их.
+TXT_WEEK = frozenset({BTN_WEEK})
+TXT_MY = frozenset({BTN_MY})
+TXT_MONEY = frozenset({BTN_MONEY})
+TXT_MANUAL = frozenset({BTN_MANUAL, "✍️ Вписать вручную"})
+TXT_ACH = frozenset({BTN_ACH})
+TXT_PENALTY = frozenset({BTN_PENALTY})
+TXT_REPORT = frozenset({BTN_REPORT})
+TXT_SETTINGS = frozenset({BTN_SETTINGS})
 
 
 class WeekCb(CallbackData, prefix="wk"):
@@ -36,7 +53,7 @@ class ShiftCb(CallbackData, prefix="sh"):
 
 
 class ConfirmCb(CallbackData, prefix="cf"):
-    action: str  # full | early | hours | custom | late | late_kind | absent | absent_* | pick
+    action: str  # full | early | hours | halves | late | late_kind | absent | absent_* | pick
     shift_id: int
     hours: str = ""
     arg: str = ""  # код вида нарушения для late_kind
@@ -44,13 +61,19 @@ class ConfirmCb(CallbackData, prefix="cf"):
 
 class MoneyCb(CallbackData, prefix="mn"):
     ym: str          # YYYY-MM месяца-якоря периода
-    action: str = "nav"  # nav | payout | check | payout_del | export
+    action: str = "nav"  # nav | payout | check | payout_del | export | list
 
 
 class PenaltyCb(CallbackData, prefix="pn"):
-    action: str      # nav | menu | kind | del | ratecut | close
+    action: str      # nav | menu | kind | day | day_set | manual | del | ratecut | close
     ym: str = ""     # YYYY-MM периода, к которому относится действие
     arg: str = ""    # код вида нарушения или id штрафа
+
+
+class ManualCb(CallbackData, prefix="mu"):
+    action: str      # month | shift | day | save | close
+    ym: str = ""     # YYYY-MM месяца, который вписываем
+    arg: str = ""    # номер смены или день месяца
 
 
 class SettingsCb(CallbackData, prefix="st"):
@@ -65,13 +88,21 @@ class AdminCb(CallbackData, prefix="ad"):
 
 
 def main_menu() -> ReplyKeyboardMarkup:
+    """Всё, что нужно, — кнопками: команды набирать не требуется.
+
+    Самое частое действие («записать смены») занимает всю ширину, остальное —
+    парами, чтобы подписи не переносились.
+    """
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text=BTN_WEEK), KeyboardButton(text=BTN_MY)],
-            [KeyboardButton(text=BTN_MONEY), KeyboardButton(text=BTN_MANUAL)],
-            [KeyboardButton(text=BTN_ACH), KeyboardButton(text=BTN_PENALTY)],
+            [KeyboardButton(text=BTN_WEEK)],
+            [KeyboardButton(text=BTN_MY), KeyboardButton(text=BTN_MONEY)],
+            [KeyboardButton(text=BTN_PENALTY), KeyboardButton(text=BTN_ACH)],
+            [KeyboardButton(text=BTN_MANUAL), KeyboardButton(text=BTN_REPORT)],
+            [KeyboardButton(text=BTN_SETTINGS)],
         ],
         resize_keyboard=True,
+        is_persistent=True,
     )
 
 
@@ -210,10 +241,26 @@ def money_nav(user_id: int, year: int, month: int) -> InlineKeyboardMarkup:
         )
     kb.row(
         InlineKeyboardButton(
-            text="📄 Выгрузить период в файл",
+            text="📋 Все смены списком",
+            callback_data=MoneyCb(ym=ym, action="list").pack(),
+        )
+    )
+    kb.row(
+        InlineKeyboardButton(
+            text="📄 Выгрузить в таблицу",
             callback_data=MoneyCb(ym=ym, action="export").pack(),
         )
     )
+    return kb.as_markup()
+
+
+def export_done(year: int, month: int) -> InlineKeyboardMarkup:
+    """Под присланным файлом: вернуться к деньгам или посмотреть то же в чате."""
+    ym = f"{year}-{month:02d}"
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📋 Показать в чате", callback_data=MoneyCb(ym=ym, action="list"))
+    kb.button(text="💰 Деньги за период", callback_data=MoneyCb(ym=ym))
+    kb.adjust(1)
     return kb.as_markup()
 
 
@@ -286,8 +333,36 @@ def confirm_hours(shift_id: int, with_full: bool = False) -> InlineKeyboardMarku
         )
     kb.row(
         InlineKeyboardButton(
-            text="✏️ Другое (например 6,5)",
-            callback_data=ConfirmCb(action="custom", shift_id=shift_id).pack(),
+            text="🔢 С половинками",
+            callback_data=ConfirmCb(action="halves", shift_id=shift_id).pack(),
+        )
+    )
+    kb.row(
+        InlineKeyboardButton(
+            text="⬅️ Назад", callback_data=ConfirmCb(action="pick", shift_id=shift_id).pack()
+        )
+    )
+    return kb.as_markup()
+
+
+def confirm_halves(shift_id: int) -> InlineKeyboardMarkup:
+    """Часы с шагом в полчаса — чтобы «6,5» не приходилось писать руками."""
+    kb = InlineKeyboardBuilder()
+    half = Decimal("0.5")
+    value = half
+    while value < config.SHIFT_HOURS:
+        kb.button(
+            text=domain.fmt_hours(value),
+            callback_data=ConfirmCb(
+                action="hours", shift_id=shift_id, hours=f"{value.normalize():f}"
+            ),
+        )
+        value += half
+    kb.adjust(4)
+    kb.row(
+        InlineKeyboardButton(
+            text=f"✅ Полностью ({domain.fmt_hours(config.SHIFT_HOURS)})",
+            callback_data=ConfirmCb(action="full", shift_id=shift_id).pack(),
         )
     )
     kb.row(
@@ -349,17 +424,108 @@ def penalties_nav(year: int, month: int, penalties, rate_cut: bool) -> InlineKey
     return kb.as_markup()
 
 
-def penalty_kinds(ym: str) -> InlineKeyboardMarkup:
-    """Выбор вида нарушения при ручной записи штрафа."""
+def penalty_kinds(ym: str, at_date: date | None = None) -> InlineKeyboardMarkup:
+    """Выбор вида нарушения. Дата уже выбрана кнопкой — писать её не нужно."""
     kb = InlineKeyboardBuilder()
+    suffix = f"|{at_date.isoformat()}" if at_date else ""
     for code in domain.PENALTY_ORDER:
         k = domain.penalty(code)
         kb.button(
             text=f"{k.icon} {k.title} — {domain.money(k.amount)}",
-            callback_data=PenaltyCb(action="kind", ym=ym, arg=code),
+            callback_data=PenaltyCb(action="kind", ym=ym, arg=code + suffix),
         )
+    if at_date is None:
+        kb.button(text="📅 Другой день", callback_data=PenaltyCb(action="day", ym=ym))
+    kb.button(
+        text="✏️ Своя сумма или заметка", callback_data=PenaltyCb(action="manual", ym=ym)
+    )
     kb.button(text="⬅️ Назад", callback_data=PenaltyCb(action="nav", ym=ym))
     kb.adjust(1)
+    return kb.as_markup()
+
+
+def penalty_days(year: int, month: int) -> InlineKeyboardMarkup:
+    """Дни расчётного периода кнопками — для штрафа задним числом."""
+    ym = f"{year}-{month:02d}"
+    start, end = domain.period_bounds(year, month)
+    today = domain.today()
+    kb = InlineKeyboardBuilder()
+    d = start
+    while d <= end:
+        mark = "•" if d == today else ""
+        kb.button(
+            text=f"{mark}{d.day} {domain.WEEKDAY_SHORT[d.weekday()]}",
+            callback_data=PenaltyCb(action="day_set", ym=ym, arg=d.isoformat()),
+        )
+        d += timedelta(days=1)
+    kb.adjust(4)
+    kb.row(
+        InlineKeyboardButton(
+            text="⬅️ Назад", callback_data=PenaltyCb(action="menu", ym=ym).pack()
+        )
+    )
+    return kb.as_markup()
+
+
+# --- Вписать смены за прошлые дни -----------------------------------------
+
+def manual_shift_choice(year: int, month: int) -> InlineKeyboardMarkup:
+    """Какую смену вписываем. Месяц листается стрелками — набирать даты не нужно."""
+    ym = f"{year}-{month:02d}"
+    py, pm = domain.prev_month(year, month)
+    ny, nm = domain.next_month(year, month)
+    kb = InlineKeyboardBuilder()
+    kb.row(
+        InlineKeyboardButton(
+            text=f"◀️ {domain.MONTHS_NOM[pm - 1]}",
+            callback_data=ManualCb(action="month", ym=f"{py}-{pm:02d}").pack(),
+        ),
+        InlineKeyboardButton(
+            text=f"{domain.MONTHS_NOM[nm - 1]} ▶️",
+            callback_data=ManualCb(action="month", ym=f"{ny}-{nm:02d}").pack(),
+        ),
+    )
+    for num in (1, 2, 3):
+        shift = domain.shift(num)
+        tag = "🌙 ночная" if shift.is_night else "☀️ дневная"
+        kb.row(
+            InlineKeyboardButton(
+                text=f"{shift.title} {shift.hours_label} · {tag}",
+                callback_data=ManualCb(action="shift", ym=ym, arg=str(num)).pack(),
+            )
+        )
+    kb.row(
+        InlineKeyboardButton(text="✖️ Закрыть", callback_data=ManualCb(action="close").pack())
+    )
+    return kb.as_markup()
+
+
+def manual_days(year: int, month: int, num: int, selected: set[date]) -> InlineKeyboardMarkup:
+    """Все дни месяца кнопками.
+
+    В отличие от планирования недели тут не фильтруем по дню недели: смены
+    случаются и в субботу, а задним числом важно записать то, что было.
+    """
+    ym = f"{year}-{month:02d}"
+    kb = InlineKeyboardBuilder()
+    last = calendar.monthrange(year, month)[1]
+    for day in range(1, last + 1):
+        d = date(year, month, day)
+        mark = "✅" if d in selected else ""
+        kb.button(
+            text=f"{mark}{day} {domain.WEEKDAY_SHORT[d.weekday()]}",
+            callback_data=ManualCb(action="day", ym=ym, arg=str(day)),
+        )
+    kb.adjust(4)
+    kb.row(
+        InlineKeyboardButton(
+            text=f"💾 Сохранить ({len(selected)})",
+            callback_data=ManualCb(action="save", ym=ym, arg=str(num)).pack(),
+        ),
+        InlineKeyboardButton(
+            text="⬅️ Назад", callback_data=ManualCb(action="month", ym=ym).pack()
+        ),
+    )
     return kb.as_markup()
 
 
