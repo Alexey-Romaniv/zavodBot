@@ -116,8 +116,13 @@ systemctl restart "$SERVICE"
 
 # Ждём не «active» (systemd ставит его сразу), а строку из лога самого бота:
 # она означает, что токен принят и polling начался.
+#
+# Журнал читаем в переменную, а не через `journalctl | grep -q`: при pipefail
+# grep -q закрывает пайп на первом же совпадении, journalctl получает SIGPIPE
+# и возвращает 141 — и найденная строка читается как «не найдено».
 for _ in $(seq "$HEALTH_TIMEOUT"); do
-    if journalctl -u "$SERVICE" --since "$STARTED" --no-pager 2>/dev/null | grep -q "Бот запущен"; then
+    JOURNAL="$(journalctl -u "$SERVICE" --since "$STARTED" --no-pager 2>/dev/null || true)"
+    if [[ $JOURNAL == *"Бот запущен"* ]]; then
         HEALTHY=1
         break
     fi
@@ -129,7 +134,7 @@ done
 
 if [[ "${HEALTHY:-0}" != 1 ]]; then
     printf '\n✖ Бот не поднялся за %s с. Последние строки журнала:\n' "$HEALTH_TIMEOUT" >&2
-    journalctl -u "$SERVICE" --since "$STARTED" --no-pager | tail -30 >&2
+    printf '%s\n' "${JOURNAL:-(журнал пуст)}" | tail -30 >&2
     rollback
     fail "деплой отменён"
 fi
@@ -137,4 +142,4 @@ fi
 step "Готово"
 sudo -u "$OWNER" "$PY" "$APP/migrate.py" --check | sed 's/^/  /'
 echo "  версия кода: ${DEPLOY_SHA:-неизвестно}"
-journalctl -u "$SERVICE" --since "$STARTED" --no-pager | tail -5 | sed 's/^/  /'
+printf '%s\n' "$JOURNAL" | tail -5 | sed 's/^/  /'
