@@ -77,6 +77,10 @@ rsync -a --delete \
     "$SRC/" "$APP/"
 [[ -n "${DEPLOY_SHA:-}" ]] && echo "$DEPLOY_SHA" > "$APP/.deployed-sha"
 chown -R "$OWNER:$OWNER" "$APP"
+# rsync -a переносит на приёмник и права каталога-источника, а деплой распаковывает
+# код во временный каталог с правами 700 — задаём права явно, чтобы каталог
+# приложения не зависел от того, откуда приехал код.
+chmod 755 "$APP"
 chmod 600 "$APP/.env"
 chmod +x "$APP/deploy"/*.sh 2>/dev/null || true
 
