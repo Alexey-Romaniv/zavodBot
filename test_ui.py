@@ -73,6 +73,19 @@ def test_pref_labels_match_database_flags():
     assert flags == set(db.PREF_FLAGS)
 
 
+def test_menu_version_is_delivered_once():
+    """Устаревшую клавиатуру досылаем один раз, а не при каждом сообщении."""
+    uid = sample_user()
+    assert db.menu_version(uid) == 0          # новый пользователь ещё не видел меню
+    assert db.menu_version(uid) < kb.MENU_VERSION
+    db.set_menu_version(uid, kb.MENU_VERSION)
+    assert db.menu_version(uid) == kb.MENU_VERSION
+    # соседа это не касается
+    other = 7002
+    db.ensure_user(other)
+    assert db.menu_version(other) == 0
+
+
 # --- Настройки ------------------------------------------------------------
 
 def test_settings_menu_has_toggle_for_every_flag():

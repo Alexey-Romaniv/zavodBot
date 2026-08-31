@@ -175,6 +175,12 @@ def _v6(conn: sqlite3.Connection) -> None:
     _add_column(conn, "shifts", "leave_reminded", "INTEGER NOT NULL DEFAULT 0")
 
 
+# 7. Какую версию главного меню пользователь уже получил.
+_V7 = _columns_step(
+    ("users", "menu_version", "INTEGER NOT NULL DEFAULT 0"),
+)
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "пользователи и смены", _V1),
     Migration(2, "подтверждение смены и фактические часы", _V2),
@@ -182,6 +188,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(4, "достижения, тон и журнал обращений", _v4),
     Migration(5, "профили пользователей и сессии админа", _v5),
     Migration(6, "настройки уведомлений, «пора выходить», выплаты", _v6),
+    Migration(7, "версия главного меню у пользователя", _V7),
 )
 
 TARGET = MIGRATIONS[-1].version

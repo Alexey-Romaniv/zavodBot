@@ -67,6 +67,7 @@ async def main() -> None:
     )
     dp = Dispatcher(storage=MemoryStorage())
     dp.update.outer_middleware(middlewares.RememberUser())
+    dp.message.middleware(middlewares.FreshMenu())
     dp.include_router(handlers.router)
     dp.include_router(handlers_admin.router)
 

@@ -299,6 +299,23 @@ def set_evening_hour(user_id: int, hour: int | None) -> None:
         _c().commit()
 
 
+def menu_version(user_id: int) -> int:
+    """Какую версию главного меню пользователь уже видел (0 — ещё никакую)."""
+    with _lock:
+        r = _c().execute(
+            "SELECT menu_version FROM users WHERE user_id = ?", (user_id,)
+        ).fetchone()
+    return int(r["menu_version"] or 0) if r else 0
+
+
+def set_menu_version(user_id: int, version: int) -> None:
+    with _lock:
+        _c().execute(
+            "UPDATE users SET menu_version = ? WHERE user_id = ?", (version, user_id)
+        )
+        _c().commit()
+
+
 def set_muted_until(user_id: int, until: datetime | None) -> None:
     with _lock:
         _c().execute(
